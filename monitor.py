@@ -31,7 +31,7 @@ from report import (
     print_master_summary,
     print_product_block,
 )
-from sheets import read_catalog, write_report_rows
+from storage import read_catalog, write_report_rows
 
 load_dotenv()
 

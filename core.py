@@ -14,10 +14,13 @@ import requests
 from bs4 import BeautifulSoup
 
 from parsers import get_parser
-from sheets import CatalogRow
+from storage import CatalogRow
 
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 60  # 60s — Shopify & JS-heavy pages need more time
+
+MIN_IMAGES   = 5    # flag if fewer than this many images
+MIN_TITLE_WORDS = 5  # flag if title has this many words or fewer
 
 
 # ──────────────────────────────────────────────
@@ -28,12 +31,17 @@ def fetch_html(url: str) -> tuple[str | None, str | None]:
     api_key = os.environ.get("SCRAPINGBEE_API_KEY")
     if not api_key:
         return None, "SCRAPINGBEE_API_KEY not set."
+    # Clean the URL — remove any whitespace that breaks ScrapingBee
+    url = url.strip()
+
     params = {
         "api_key": api_key,
         "url": url,
         "render_js": "true",
         "premium_proxy": "true",
         "country_code": "in",
+        "block_resources": "false",   # required for Amazon & JS-heavy pages
+        "wait": "2000",               # wait 2s for JS to finish rendering
     }
     try:
         resp = requests.get(SCRAPINGBEE_URL, params=params, timeout=REQUEST_TIMEOUT)
@@ -63,31 +71,43 @@ def scrape_listing(row: CatalogRow) -> dict:
     if fetch_err:
         return {
             "product_name": row.product_name,
-            "platform": row.platform_name,
-            "url": row.url,
-            "price": None,
-            "buy_box": False,
-            "sizes": [],
-            "colors": [],
-            "flags": [f"FETCH ERROR: {fetch_err}"],
-            "status": "ERROR",
-            "error": fetch_err,
+            "platform":     row.platform_name,
+            "url":          row.url,
+            "price":        None,
+            "title":        None,
+            "title_ok":     None,
+            "images_count": 0,
+            "buy_box":      False,
+            "in_stock":     False,
+            "sold_by":      None,
+            "sizes":              [],
+            "sizes_unavailable":  [],
+            "colors":       [],
+            "flags":        [f"FETCH ERROR: {fetch_err}"],
+            "status":       "ERROR",
+            "error":        fetch_err,
         }
 
     soup = BeautifulSoup(html, "html.parser")
-    parsed = parser_fn(soup)
+    p = parser_fn(soup)
 
     return {
         "product_name": row.product_name,
-        "platform": row.platform_name,
-        "url": row.url,
-        "price": parsed.get("price"),
-        "buy_box": parsed.get("buy_box", False),
-        "sizes": parsed.get("sizes", []),
-        "colors": parsed.get("colors", []),
-        "flags": [],
-        "status": "GREEN",
-        "error": parsed.get("error"),
+        "platform":     row.platform_name,
+        "url":          row.url,
+        "price":        p.get("price"),
+        "title":        p.get("title"),
+        "title_ok":     p.get("title_ok"),
+        "images_count": p.get("images_count", 0),
+        "buy_box":      p.get("buy_box", False),
+        "in_stock":     p.get("in_stock"),
+        "sold_by":      p.get("sold_by"),
+        "sizes":              p.get("sizes", []),
+        "sizes_unavailable":  p.get("sizes_unavailable", []),
+        "colors":       p.get("colors", []),
+        "flags":        [],
+        "status":       "GREEN",
+        "error":        p.get("error"),
     }
 
 
@@ -96,24 +116,44 @@ def scrape_listing(row: CatalogRow) -> dict:
 # ──────────────────────────────────────────────
 
 def compute_flags(results: list[dict]) -> list[dict]:
-    """Attach flags and statuses to a list of same-product results."""
-    valid = [r for r in results if not r.get("error")]
+    """Attach flags and statuses to all platform results for one product."""
+    valid   = [r for r in results if not r.get("error")]
     errored = [r for r in results if r.get("error")]
 
+    # ── Parse / fetch errors
     for r in errored:
         r["flags"].append(f"PARSE ERROR on {r['platform']}: {r['error']}")
 
     for r in valid:
-        if not r["buy_box"]:
-            r["flags"].append(f"NOT PURCHASABLE on {r['platform']}")
+        # ── Out of stock / not purchasable
+        if r.get("in_stock") is False:
+            r["flags"].append(f"OUT OF STOCK on {r['platform']}")
+        elif not r["buy_box"]:
+            r["flags"].append(f"NOT PURCHASABLE on {r['platform']} (no Add to Cart / Buy Now)")
 
+        # ── Low image count
+        n_imgs = r.get("images_count", 0)
+        if n_imgs < MIN_IMAGES:
+            r["flags"].append(f"LOW IMAGE COUNT on {r['platform']}: only {n_imgs} image(s) (need {MIN_IMAGES}+)")
+
+        # ── Title too short
+        if r.get("title_ok") is False:
+            words = len((r.get("title") or "").split())
+            r["flags"].append(f"TITLE TOO SHORT on {r['platform']}: {words} word(s) (need {MIN_TITLE_WORDS}+)")
+
+        # ── Sizes out of stock on this platform
+        unavail = r.get("sizes_unavailable", [])
+        if unavail:
+            r["flags"].append(f"SIZES OUT OF STOCK on {r['platform']}: {', '.join(unavail)}")
+
+    # ── Price parity (cross-platform)
     prices = {r["platform"]: r["price"] for r in valid if r["price"] is not None}
     if len(prices) >= 2:
         min_plat = min(prices, key=prices.get)
         max_plat = max(prices, key=prices.get)
         gap = prices[max_plat] - prices[min_plat]
         if gap > 50:
-            ref = [p for p, v in prices.items() if v == prices[max_plat]]
+            ref   = [p for p, v in prices.items() if v == prices[max_plat]]
             cheap = [p for p, v in prices.items() if v == prices[min_plat]]
             flag_msg = f"PRICE GAP ₹{gap:,}: {', '.join(cheap)} cheaper than {', '.join(ref)}"
             for r in results:
@@ -121,32 +161,21 @@ def compute_flags(results: list[dict]) -> list[dict]:
                     r["flags"].append(flag_msg)
                     break
 
-    parseable_sizes = {
+    # ── Missing sizes across platforms
+    parseable = {
         r["platform"]: set(r["sizes"])
         for r in valid
         if r["sizes"] and r["sizes"] != ["Could not parse"]
     }
-    if len(parseable_sizes) >= 2:
-        all_sizes = set().union(*parseable_sizes.values())
+    if len(parseable) >= 2:
+        all_sizes = set().union(*parseable.values())
         for r in valid:
-            if r["platform"] in parseable_sizes:
-                missing = all_sizes - parseable_sizes[r["platform"]]
+            if r["platform"] in parseable:
+                missing = all_sizes - parseable[r["platform"]]
                 if missing:
                     r["flags"].append(f"MISSING SIZES on {r['platform']}: {', '.join(sorted(missing))}")
 
-    parseable_colors = {
-        r["platform"]: set(r["colors"])
-        for r in valid
-        if r["colors"] and r["colors"] != ["Could not parse"]
-    }
-    if len(parseable_colors) >= 2:
-        all_colors = set().union(*parseable_colors.values())
-        for r in valid:
-            if r["platform"] in parseable_colors:
-                missing = all_colors - parseable_colors[r["platform"]]
-                if missing:
-                    r["flags"].append(f"MISSING COLORS on {r['platform']}: {', '.join(sorted(missing))}")
-
+    # ── Status assignment
     for r in results:
         n = len(r["flags"])
         if r.get("error"):
@@ -157,7 +186,9 @@ def compute_flags(results: list[dict]) -> list[dict]:
             r["status"] = "YELLOW"
         else:
             r["status"] = "RED"
-        if any("NOT PURCHASABLE" in f or "PARSE ERROR" in f or "FETCH ERROR" in f for f in r["flags"]):
+
+        critical = ("OUT OF STOCK", "NOT PURCHASABLE", "PARSE ERROR", "FETCH ERROR")
+        if any(any(c in f for c in critical) for f in r["flags"]):
             r["status"] = "RED"
 
     return results
@@ -179,26 +210,20 @@ def collect_product_flags(results: list[dict]) -> list[str]:
 
 
 # ──────────────────────────────────────────────
-# Full run (used by CLI; dashboard calls scrape_listing directly for live progress)
+# Full run
 # ──────────────────────────────────────────────
 
 def run_scrape(
     catalog_rows: list[CatalogRow],
-    progress_callback=None,   # callable(product, platform, index, total)
+    progress_callback=None,
     delay: bool = True,
 ) -> tuple[list[dict], dict[str, list[str]], str]:
-    """
-    Scrape all rows, compute flags, return:
-        (all_results, flags_by_product, timestamp)
-    progress_callback is called before each request so callers can update UI.
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    by_product: dict[str, list[CatalogRow]] = defaultdict(list)
+    timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    by_product = defaultdict(list)
     for row in catalog_rows:
         by_product[row.product_name].append(row)
 
-    all_results: list[dict] = []
-    flags_by_product: dict[str, list[str]] = {}
+    all_results, flags_by_product = [], {}
     total = sum(len(v) for v in by_product.values())
     idx = 0
 
