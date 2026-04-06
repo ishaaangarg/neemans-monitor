@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets & credentials — NEVER commit these
+.env
+*.json
+!.streamlit/secrets.toml.example
+
+# Streamlit local secrets (real values)
+.streamlit/secrets.toml
+
+# Temp files written by dashboard
+neemans_creds_*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
