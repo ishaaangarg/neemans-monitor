@@ -469,6 +469,7 @@ with tab_report:
 
             # Available sizes summary row per platform
             sizes_detail = ""
+            colors_detail = ""
             for r in prod_results:
                 sz_avail   = [s for s in r.get("sizes", []) if s != "Could not parse"]
                 sz_unavail = r.get("sizes_unavailable", [])
@@ -484,12 +485,33 @@ with tab_report:
                         f'text-decoration:line-through">{s}</span>'
                         for s in sz_unavail
                     )
-                    sizes_detail += f"""
-                    <div style="margin:6px 0">
-                      <span style="font-size:12px;font-weight:600;color:#475569;min-width:90px;
-                                   display:inline-block">{r['platform']}:</span>
-                      {avail_pills}{unavail_pills}
-                    </div>"""
+                    sizes_detail += (
+                        f'<div style="margin:6px 0">'
+                        f'<span style="font-size:12px;font-weight:600;color:#475569;min-width:90px;'
+                        f'display:inline-block">{r["platform"]}:</span>'
+                        f'{avail_pills}{unavail_pills}</div>'
+                    )
+
+                col_avail   = r.get("colors", [])
+                col_unavail = r.get("colors_unavailable", [])
+                if col_avail or col_unavail:
+                    avail_cpills = "".join(
+                        f'<span style="background:#dcfce7;color:#166534;border-radius:4px;'
+                        f'padding:2px 7px;font-size:12px;margin:2px;display:inline-block">{c}</span>'
+                        for c in col_avail
+                    )
+                    unavail_cpills = "".join(
+                        f'<span style="background:#fee2e2;color:#991b1b;border-radius:4px;'
+                        f'padding:2px 7px;font-size:12px;margin:2px;display:inline-block;'
+                        f'text-decoration:line-through">{c}</span>'
+                        for c in col_unavail
+                    )
+                    colors_detail += (
+                        f'<div style="margin:6px 0">'
+                        f'<span style="font-size:12px;font-weight:600;color:#475569;min-width:90px;'
+                        f'display:inline-block">{r["platform"]}:</span>'
+                        f'{avail_cpills}{unavail_cpills}</div>'
+                    )
 
             flags_html = "".join(
                 f'<div class="flag-pill{"" if "ERROR" not in f else "-error"}">⚠ {f}</div>'
@@ -498,7 +520,19 @@ with tab_report:
 
             sizes_section = ""
             if sizes_detail:
-                sizes_section = '<div style="font-size:12px;font-weight:600;color:#64748b;margin:12px 0 6px;text-transform:uppercase;letter-spacing:.05em">Size Availability</div>' + sizes_detail
+                sizes_section = (
+                    '<div style="font-size:12px;font-weight:600;color:#64748b;margin:12px 0 6px;'
+                    'text-transform:uppercase;letter-spacing:.05em">Size Availability</div>'
+                    + sizes_detail
+                )
+
+            colors_section = ""
+            if colors_detail:
+                colors_section = (
+                    '<div style="font-size:12px;font-weight:600;color:#64748b;margin:12px 0 6px;'
+                    'text-transform:uppercase;letter-spacing:.05em">Colour Availability</div>'
+                    + colors_detail
+                )
 
             html_block = (
                 '<div class="product-card">'
@@ -513,7 +547,8 @@ with tab_report:
                 '</tr></thead>'
                 f'<tbody>{rows_html}</tbody>'
                 '</table>'
-                + sizes_section +
+                + sizes_section
+                + colors_section +
                 '<div style="border-top:1px solid #f1f5f9;margin:12px 0 8px"></div>'
                 '<div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Flags</div>'
                 + flags_html +

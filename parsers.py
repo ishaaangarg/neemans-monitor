@@ -66,6 +66,7 @@ def _empty_result(error: str | None = None) -> dict:
         "sizes": [],
         "sizes_unavailable": [],
         "colors": [],
+        "colors_unavailable": [],
         "error": error,
     }
 
@@ -125,38 +126,56 @@ def parse_amazon_in(soup: BeautifulSoup) -> dict:
                 break
 
         # ── Sizes — split available vs unavailable
-        # Use ONLY the dedicated variation widget IDs — never broad selectors
         sizes, sizes_unavailable = [], []
         for li in soup.select(
             "#variation_size_name ul li, "
             "#native_dropdown_selected_size_name option"
         ):
-            val = li.get("data-value") or _text(li)
-            if not val:
+            val = (li.get("data-value") or _text(li) or "").strip()
+            if not val or val.lower() in ("", "select", "-1", "size"):
                 continue
-            val = val.strip()
-            if val.lower() in ("", "select", "-1", "size"):
-                continue
-            if not _is_valid_size(val):          # skip non-size values
+            if not _is_valid_size(val):
                 continue
             classes = " ".join(li.get("class") or [])
+            # Unavailable = a-disabled class OR aria-disabled OR contains unavailable child
             is_unavail = (
                 "a-disabled" in classes
+                or li.get("aria-disabled") == "true"
                 or bool(li.find(class_=re.compile(r"a-disabled|cross-icon|unavailable", re.I)))
+                or "currently unavailable" in _text(li).lower()
             )
             (sizes_unavailable if is_unavail else sizes).append(val)
         result["sizes"] = list(dict.fromkeys(sizes))
         result["sizes_unavailable"] = list(dict.fromkeys(sizes_unavailable))
 
-        # ── Colors — available only
-        colors = []
+        # ── Colors — available + unavailable (image-swatch style used by Neemans on Amazon)
+        colors_avail, colors_unavail = [], []
         for li in soup.select("#variation_color_name ul li"):
+            # Title attribute holds the color name
             title_attr = li.get("title", "")
             val = re.sub(r"^Click to select\s*", "", title_attr, flags=re.I).strip()
+            if not val:
+                # Fallback: img alt text
+                img = li.find("img")
+                val = (img.get("alt", "") if img else "").strip()
+            if not val:
+                continue
             classes = " ".join(li.get("class") or [])
-            if val and "a-disabled" not in classes:
-                colors.append(val)
-        result["colors"] = colors
+            li_text  = _text(li).lower()
+            # Image-swatch style: "Currently unavailable." appears as text inside the li
+            is_unavail = (
+                "a-disabled" in classes
+                or li.get("aria-disabled") == "true"
+                or "currently unavailable" in li_text
+                or "unavailable" in classes.lower()
+            )
+            if is_unavail:
+                colors_unavail.append(val)
+            else:
+                colors_avail.append(val)
+        result["colors"] = colors_avail
+        # Store unavailable colors in the result so dashboard can show them
+        result["colors_unavailable"] = colors_unavail
 
         result["error"] = None
     except Exception as exc:
