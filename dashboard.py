@@ -364,8 +364,8 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ──────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ──────────────────────────────────────────────────────────────────────────────
-tab_report, tab_catalog, tab_history, tab_setup = st.tabs([
-    "📊 Health Report", "📋 Catalog", "🕒 Run History", "⚙️ Setup",
+tab_report, tab_catalog, tab_history, tab_setup, tab_debug = st.tabs([
+    "📊 Health Report", "📋 Catalog", "🕒 Run History", "⚙️ Setup", "🔍 Debug HTML",
 ])
 
 
@@ -720,3 +720,57 @@ with tab_setup:
         {"Product Internal Name":"Hemp Runner","Platform Name":"Nykaa",
          "Platform URL":"https://nykaa.com/...","Active":"FALSE"},
     ]), use_container_width=True, hide_index=True)
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Debug HTML
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_debug:
+    st.markdown("### 🔍 Debug — Raw HTML from ScrapingBee")
+    st.caption(
+        "Every scrape automatically saves the raw HTML ScrapingBee returned. "
+        "Download a file and send it to your developer to diagnose parser issues."
+    )
+
+    debug_dir = Path("debug_html")
+    html_files = sorted(debug_dir.glob("*.html")) if debug_dir.exists() else []
+
+    if not html_files:
+        st.info("No debug HTML files yet. Run a health check first — files will appear here automatically.")
+    else:
+        for f in html_files:
+            size_kb = f.stat().st_size // 1024
+            col_a, col_b, col_c = st.columns([3, 1, 1])
+            col_a.markdown(f"**{f.stem.replace('_', '.')}**")
+            col_b.caption(f"{size_kb} KB")
+            with col_c:
+                st.download_button(
+                    label="⬇️ Download",
+                    data=f.read_bytes(),
+                    file_name=f.name,
+                    mime="text/html",
+                    key=f"dl_{f.name}",
+                )
+
+        st.markdown("---")
+        st.markdown("**Quick diagnosis for each file:**")
+        for f in html_files:
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace").lower()
+                checks = {
+                    "Page has product title (h1)": "<h1" in content,
+                    "Price symbol found (₹)":      "₹" in content,
+                    "Select Size text found":       "select size" in content,
+                    "Buy button text found":        "add to cart" in content or "add to bag" in content or "buy now" in content,
+                    "Product images (CDN found)":   "rukminim" in content or "myntassets" in content or "media.amazon" in content or "m.media-amazon" in content,
+                    "CAPTCHA / bot block":          "captcha" in content or "access denied" in content or "robot" in content,
+                    "Maintenance / error page":     "site maintenance" in content or "something went wrong" in content or "529" in content,
+                }
+                with st.expander(f"📄 {f.stem.replace('_', '.')} — click to expand diagnosis"):
+                    for label, ok in checks.items():
+                        icon = "✅" if ok else "❌"
+                        # Invert logic for bad signals
+                        if label in ("CAPTCHA / bot block", "Maintenance / error page"):
+                            icon = "🚨" if ok else "✅"
+                        st.markdown(f"{icon} {label}")
+            except Exception as e:
+                st.warning(f"Could not read {f.name}: {e}")

@@ -43,6 +43,17 @@ def _text(tag) -> str:
 def _title_ok(title: str) -> bool:
     return len(title.split()) > 5
 
+# Valid size pattern: numeric (6, 6.5, 10), numeric+suffix (6 UK, 10 US, 42 EU),
+# clothing codes (XS S M L XL XXL 2XL 3XL 4XL), or short alpha codes (ONE SIZE)
+_SIZE_RE = re.compile(
+    r"^(\d{1,3}(\.\d)?\s*(UK|US|EU|IN|CM)?|XS|S|M|L|XL|XXL|XXXL|[2-4]XL|ONE\s*SIZE|FREE\s*SIZE)$",
+    re.I,
+)
+
+def _is_valid_size(val: str) -> bool:
+    """Return True only if val looks like an actual size (not a category/brand name)."""
+    return bool(_SIZE_RE.match(val.strip()))
+
 def _empty_result(error: str | None = None) -> dict:
     return {
         "price": None,
@@ -114,27 +125,28 @@ def parse_amazon_in(soup: BeautifulSoup) -> dict:
                 break
 
         # ── Sizes — split available vs unavailable
+        # Use ONLY the dedicated variation widget IDs — never broad selectors
         sizes, sizes_unavailable = [], []
-        # Amazon renders sizes as li elements or as a select dropdown
         for li in soup.select(
             "#variation_size_name ul li, "
-            "#native_dropdown_selected_size_name option, "
-            "div[id*='size'] ul li, "
-            "ul.a-nostyle li[data-value]"
+            "#native_dropdown_selected_size_name option"
         ):
             val = li.get("data-value") or _text(li)
-            if not val or val.strip().lower() in ("", "select", "-1"):
+            if not val:
                 continue
             val = val.strip()
+            if val.lower() in ("", "select", "-1", "size"):
+                continue
+            if not _is_valid_size(val):          # skip non-size values
+                continue
             classes = " ".join(li.get("class") or [])
-            # Unavailable = a-disabled class, or contains a crossed-out icon
             is_unavail = (
                 "a-disabled" in classes
                 or bool(li.find(class_=re.compile(r"a-disabled|cross-icon|unavailable", re.I)))
             )
             (sizes_unavailable if is_unavail else sizes).append(val)
-        result["sizes"] = sizes
-        result["sizes_unavailable"] = sizes_unavailable
+        result["sizes"] = list(dict.fromkeys(sizes))
+        result["sizes_unavailable"] = list(dict.fromkeys(sizes_unavailable))
 
         # ── Colors — available only
         colors = []
@@ -200,18 +212,23 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
                 s = img.get(attr, "")
                 if s and ("rukminim" in s or "flixcart" in s) and "sprite" not in s:
                     srcs.add(s.split("?")[0].split("._")[0])
-        # Fallback: any product-looking HTTP image if CDN filtering found too few
+        # Fallback: look in main product container only (not whole page)
         if len(srcs) < 3:
-            srcs.update(
-                s.split("?")[0].split("._")[0]
-                for img in soup.find_all("img")
-                for attr in ("src", "data-src")
-                if (s := img.get(attr, ""))
-                and s.startswith("http")
-                and "sprite" not in s
-                and "logo" not in s.lower()
-                and "icon" not in s.lower()
-            )
+            # Try to scope to the left-hand image column — typically the first large div
+            for container_sel in [
+                "div[class*='_3qGmHb']", "div[class*='_2r_T1I']",
+                "div[class*='CXW8mj']",  "div[class*='q6DClP']",
+                "div[data-testid*='image']",
+            ]:
+                container = soup.select_one(container_sel)
+                if container:
+                    for img in container.find_all("img"):
+                        for attr in ("src", "data-src"):
+                            s = img.get(attr, "")
+                            if s and s.startswith("http") and "sprite" not in s:
+                                srcs.add(s.split("?")[0].split("._")[0])
+                    if len(srcs) >= 3:
+                        break
         result["images_count"] = len(srcs)
 
         # ── Price: ₹ regex scan — immune to class-name changes
@@ -279,7 +296,7 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
         if size_container:
             for li in size_container.find_all("li"):
                 val = _text(li).split("\n")[0].strip()
-                if not val or len(val) > 6:
+                if not val or not _is_valid_size(val):
                     continue
                 classes = " ".join(li.get("class") or [])
                 # Flipkart marks OOS sizes with _9E25nV or aria-disabled
@@ -348,18 +365,22 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
                 s = img.get(attr, "")
                 if s and "myntassets" in s and "logo" not in s.lower():
                     srcs.add(s.split("?")[0])
-        # Fallback: any sizable HTTP image
+        # Fallback: scope to the product image column, not the entire page
         if len(srcs) < 3:
-            srcs.update(
-                s.split("?")[0]
-                for img in soup.find_all("img")
-                for attr in ("src", "data-src")
-                if (s := img.get(attr, ""))
-                and s.startswith("http")
-                and "sprite" not in s
-                and "logo" not in s.lower()
-                and "icon" not in s.lower()
-            )
+            for container_sel in [
+                "div[class*='image-grid']", "div[class*='ImageGrid']",
+                "ul[class*='image-grid']", "div[class*='pdp-images']",
+                "div[class*='product-image']",
+            ]:
+                container = soup.select_one(container_sel)
+                if container:
+                    for img in container.find_all("img"):
+                        for attr in ("src", "data-src"):
+                            s = img.get(attr, "")
+                            if s and s.startswith("http") and "sprite" not in s and "logo" not in s.lower():
+                                srcs.add(s.split("?")[0])
+                    if len(srcs) >= 3:
+                        break
         result["images_count"] = len(srcs)
 
         # ── Price: ₹ regex scan — immune to class-name changes
@@ -416,9 +437,9 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
         if size_container:
             seen_vals = set()
             for item in size_container.find_all(["li", "button"]):
-                # Prefer innermost text (button inside li)
                 val = _text(item).split("\n")[0].strip()
-                if not val or len(val) > 6 or val in seen_vals:
+                # Only accept values that look like real sizes
+                if not val or val in seen_vals or not _is_valid_size(val):
                     continue
                 seen_vals.add(val)
                 classes     = " ".join(item.get("class") or [])
@@ -437,6 +458,21 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
 
         result["sizes"]             = list(dict.fromkeys(sizes))
         result["sizes_unavailable"] = list(dict.fromkeys(sizes_unavailable))
+
+        # ── Sold by: Myntra products are typically "Sold by Myntra" or a marketplace seller
+        for node in soup.find_all(string=re.compile(r"(Sold|Fulfilled|Ships)\s+by", re.I)):
+            parent = node.find_parent()
+            a_tag  = parent.find("a") if parent else None
+            if a_tag:
+                result["sold_by"] = _text(a_tag).strip()
+                break
+            elif parent:
+                val = re.sub(r"(Sold|Fulfilled|Ships)\s+by\s*:?\s*", "", _text(parent), flags=re.I).strip()
+                if val and len(val) < 50:
+                    result["sold_by"] = val
+                    break
+        if not result["sold_by"]:
+            result["sold_by"] = "Myntra"   # Myntra is always the seller
 
         # ── Colors: walk DOM from "Colour" / "Color" label
         colors = []

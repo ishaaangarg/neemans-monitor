@@ -4,10 +4,12 @@ Used by both monitor.py (CLI) and dashboard.py (web UI).
 """
 
 import os
+import re
 import random
 import time
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
@@ -17,37 +19,59 @@ from parsers import get_parser
 from storage import CatalogRow
 
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
-REQUEST_TIMEOUT = 60  # 60s — Shopify & JS-heavy pages need more time
+REQUEST_TIMEOUT = 90  # increased — FK/Myntra need more time with stealth proxy
 
-MIN_IMAGES   = 5    # flag if fewer than this many images
-MIN_TITLE_WORDS = 5  # flag if title has this many words or fewer
+MIN_IMAGES      = 5
+MIN_TITLE_WORDS = 5
+
+# Folder where raw HTML dumps are saved for debugging
+DEBUG_DIR = Path("debug_html")
 
 
 # ──────────────────────────────────────────────
 # ScrapingBee fetch
 # ──────────────────────────────────────────────
 
-def fetch_html(url: str) -> tuple[str | None, str | None]:
+# Sites that need stealth proxy (extra anti-bot measures)
+_STEALTH_DOMAINS = {"flipkart.com", "www.flipkart.com", "myntra.com", "www.myntra.com"}
+
+def fetch_html(url: str, save_debug: bool = True) -> tuple[str | None, str | None]:
     api_key = os.environ.get("SCRAPINGBEE_API_KEY")
     if not api_key:
         return None, "SCRAPINGBEE_API_KEY not set."
-    # Clean the URL — remove any whitespace that breaks ScrapingBee
     url = url.strip()
+    domain = urlparse(url).netloc.lower()
+    stealth = domain in _STEALTH_DOMAINS
 
     params = {
-        "api_key": api_key,
-        "url": url,
-        "render_js": "true",
-        "premium_proxy": "true",
-        "country_code": "in",
-        "block_resources": "false",   # required for Amazon & JS-heavy pages
-        "wait": "2000",               # wait 2s for JS to finish rendering
+        "api_key":        api_key,
+        "url":            url,
+        "render_js":      "true",
+        "stealth_proxy":  "true" if stealth else "false",
+        "premium_proxy":  "true",
+        "country_code":   "in",
+        "block_resources":"false",
+        "wait":           "4000" if stealth else "2000",
+        "window_width":   "1920",
+        "window_height":  "1080",
     }
     try:
         resp = requests.get(SCRAPINGBEE_URL, params=params, timeout=REQUEST_TIMEOUT)
+        html = resp.text
+
+        # ── Save raw HTML for debugging (always, silently)
+        if save_debug and html:
+            try:
+                DEBUG_DIR.mkdir(exist_ok=True)
+                safe = re.sub(r"[^\w\-]", "_", domain)
+                debug_file = DEBUG_DIR / f"{safe}.html"
+                debug_file.write_text(html, encoding="utf-8", errors="replace")
+            except Exception:
+                pass  # never let debug saving crash the scrape
+
         if resp.status_code == 200:
-            return resp.text, None
-        return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return html, None
+        return None, f"HTTP {resp.status_code}: {html[:300]}"
     except requests.Timeout:
         return None, f"Timeout after {REQUEST_TIMEOUT}s"
     except requests.RequestException as exc:
