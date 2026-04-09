@@ -23,6 +23,7 @@ HOW TO ADD A NEW PLATFORM PARSER
 3. Add a row to the Catalog — done
 """
 
+import json
 import re
 from bs4 import BeautifulSoup
 
@@ -119,6 +120,71 @@ def _empty_result(error: str | None = None) -> dict:
 
 
 # ──────────────────────────────────────────────
+# JSON extraction helpers
+# ──────────────────────────────────────────────
+
+def _extract_jsonld(soup) -> list[dict]:
+    """Return all JSON-LD <script> blocks parsed as dicts (flattened list)."""
+    out = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        raw = (script.string or "").strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                out.extend(data)
+            elif isinstance(data, dict):
+                out.append(data)
+        except Exception:
+            pass
+    return out
+
+
+def _extract_window_var(soup, var_name: str) -> dict:
+    """
+    Extract window.VAR_NAME = {...} JSON from inline <script> tags.
+    Uses JSONDecoder.raw_decode so trailing JS after the object is ignored.
+    """
+    pattern = re.compile(
+        r"(?:window\.)?" + re.escape(var_name) + r"\s*=\s*", re.DOTALL
+    )
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        m = pattern.search(text)
+        if not m:
+            continue
+        rest = text[m.end():].lstrip()
+        if not rest.startswith("{"):
+            continue
+        try:
+            data, _ = json.JSONDecoder().raw_decode(rest)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _extract_variationvalues(soup) -> dict:
+    """
+    Extract Amazon's variationValues object from inline scripts.
+    Returns {"size_name": [...], "color_name": [...]} or {}.
+    """
+    # The object is a flat dict with array values — no nested braces, safe regex
+    pattern = re.compile(r'"variationValues"\s*:\s*(\{[^}]+\})')
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        m = pattern.search(text)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                pass
+    return {}
+
+
+# ──────────────────────────────────────────────
 # Amazon India  (amazon.in)
 # ──────────────────────────────────────────────
 
@@ -172,106 +238,68 @@ def parse_amazon_in(soup: BeautifulSoup) -> dict:
                 result["sold_by"] = _text(tag)
                 break
 
-        # ── Sizes — split available vs unavailable
+        # ── Sizes + Colors — primary source: variationValues JSON in inline script
+        # Amazon embeds {"size_name":["6 UK","7 UK",...], "color_name":[...]} in the page JS.
+        # This is more reliable than HTML element parsing for variation widgets.
+        vv = _extract_variationvalues(soup)
         sizes, sizes_unavailable = [], []
+        colors_avail, colors_unavail = [], []
 
-        def _extract_amazon_sizes(soup):
-            """
-            Try multiple Amazon size-picker selectors in priority order.
-            Amazon uses several widget styles: twister (ul/li), dropdown, swatch grid.
-            """
-            candidates = []
+        if vv.get("size_name"):
+            for raw in vv["size_name"]:
+                val = re.sub(r"[_\-]", " ", str(raw)).strip()
+                if _is_valid_size(val):
+                    sizes.append(val)   # variationValues lists all selectable sizes (available)
 
-            # 1. Primary: twister variation (standard + shoe-specific IDs)
-            variation_div = soup.find(
-                id=re.compile(r"variation_size|variation_shoe_size", re.I)
-            )
+        if vv.get("color_name"):
+            colors_avail = [str(c).strip() for c in vv["color_name"] if str(c).strip()]
+
+        # HTML fallback for sizes: variation div (twister-style)
+        if not sizes:
+            _SKIP_SIZE_VALS = {"", "select", "-1", "size", "please select", "select size"}
+            variation_div = soup.find(id=re.compile(r"variation_size|variation_shoe_size", re.I))
             if variation_div:
-                # Try li elements with data-value first
                 for li in variation_div.find_all("li"):
                     raw = li.get("data-value") or ""
                     val = re.sub(r"[_\-]", " ", raw).strip()
                     if not val:
-                        # span inside button inside li
                         span = li.find("span", class_=re.compile(r"a-button-text|a-size", re.I))
-                        val = _text(span).strip() if span else _text(li).split("\n")[0].strip()
-                    candidates.append((li, val))
-                # Also try input[type=radio] inside the div (swatch style)
-                if not candidates:
-                    for inp in variation_div.find_all("input", type="radio"):
-                        raw = inp.get("data-value") or inp.get("value") or ""
-                        val = re.sub(r"[_\-]", " ", raw).strip()
-                        if not val:
-                            label = soup.find("label", attrs={"for": inp.get("id", "__none__")})
-                            val = _text(label).strip() if label else ""
-                        candidates.append((inp, val))
+                        val = _text(span or li).split("\n")[0].strip()
+                    val = re.sub(r"\s+", " ", val).strip()
+                    if not val or val.lower() in _SKIP_SIZE_VALS or not _is_valid_size(val):
+                        continue
+                    classes = " ".join(li.get("class") or [])
+                    is_unavail = (
+                        "a-disabled" in classes
+                        or li.get("aria-disabled") == "true"
+                        or li.get("disabled") is not None
+                        or bool(li.find(class_=re.compile(r"a-disabled|cross-icon", re.I)))
+                        or "currently unavailable" in _text(li).lower()
+                    )
+                    (sizes_unavailable if is_unavail else sizes).append(val)
 
-            # 2. Dropdown option list
-            if not candidates:
-                for sel_el in soup.select(
-                    "#native_dropdown_selected_size_name option, "
-                    "select[name*='size' i] option"
-                ):
-                    raw = sel_el.get("value", "")
-                    val = re.sub(r"[_\-]", " ", raw).strip() or _text(sel_el).strip()
-                    candidates.append((sel_el, val))
+        # HTML fallback for colors: image-swatch list
+        if not colors_avail:
+            for li in soup.select("#variation_color_name ul li"):
+                title_attr = li.get("title", "")
+                val = re.sub(r"^Click to select\s*", "", title_attr, flags=re.I).strip()
+                if not val:
+                    img = li.find("img")
+                    val = (img.get("alt", "") if img else "").strip()
+                if not val:
+                    continue
+                classes = " ".join(li.get("class") or [])
+                li_text = _text(li).lower()
+                is_unavail = (
+                    "a-disabled" in classes
+                    or li.get("aria-disabled") == "true"
+                    or "currently unavailable" in li_text
+                )
+                (colors_unavail if is_unavail else colors_avail).append(val)
 
-            # 3. Any button with data-value that looks like a size (broad fallback)
-            if not candidates:
-                for btn in soup.find_all("button", attrs={"data-value": True}):
-                    raw = btn.get("data-value", "")
-                    val = re.sub(r"[_\-]", " ", raw).strip()
-                    candidates.append((btn, val))
-
-            return candidates
-
-        _SKIP_SIZE_VALS = {"", "select", "-1", "size", "please select", "select size"}
-        for el, val in _extract_amazon_sizes(soup):
-            val = re.sub(r"\s+", " ", val).strip()
-            if not val or val.lower() in _SKIP_SIZE_VALS:
-                continue
-            if not _is_valid_size(val):
-                continue
-            classes  = " ".join(el.get("class") or [])
-            el_text  = _text(el).lower()
-            is_unavail = (
-                "a-disabled" in classes
-                or el.get("aria-disabled") == "true"
-                or el.get("disabled") is not None
-                or bool(el.find(class_=re.compile(r"a-disabled|cross-icon|unavailable", re.I)))
-                or "currently unavailable" in el_text
-            )
-            (sizes_unavailable if is_unavail else sizes).append(val)
         result["sizes"] = list(dict.fromkeys(sizes))
         result["sizes_unavailable"] = list(dict.fromkeys(sizes_unavailable))
-
-        # ── Colors — available + unavailable (image-swatch style used by Neemans on Amazon)
-        colors_avail, colors_unavail = [], []
-        for li in soup.select("#variation_color_name ul li"):
-            # Title attribute holds the color name
-            title_attr = li.get("title", "")
-            val = re.sub(r"^Click to select\s*", "", title_attr, flags=re.I).strip()
-            if not val:
-                # Fallback: img alt text
-                img = li.find("img")
-                val = (img.get("alt", "") if img else "").strip()
-            if not val:
-                continue
-            classes = " ".join(li.get("class") or [])
-            li_text  = _text(li).lower()
-            # Image-swatch style: "Currently unavailable." appears as text inside the li
-            is_unavail = (
-                "a-disabled" in classes
-                or li.get("aria-disabled") == "true"
-                or "currently unavailable" in li_text
-                or "unavailable" in classes.lower()
-            )
-            if is_unavail:
-                colors_unavail.append(val)
-            else:
-                colors_avail.append(val)
         result["colors"] = colors_avail
-        # Store unavailable colors in the result so dashboard can show them
         result["colors_unavailable"] = colors_unavail
 
         result["error"] = None
@@ -311,7 +339,7 @@ def _find_images(soup, extra_selectors=""):
 def parse_flipkart_com(soup: BeautifulSoup) -> dict:
     result = _empty_result()
     try:
-        # ── Title: h1 first, then page <title> (class names change — never rely on them)
+        # ── Title: h1 first, then page <title>
         h1 = soup.find("h1")
         title = _text(h1) if h1 else ""
         if not title or len(title) < 5:
@@ -321,55 +349,83 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
         result["title"]    = title
         result["title_ok"] = _title_ok(title)
 
-        # ── Images: filter by Flipkart/Flixcart CDN domain — class-agnostic
-        srcs = set()
-        for img in soup.find_all("img"):
-            for attr in ("src", "data-src", "data-lazy-src", "data-original"):
-                s = img.get(attr, "")
-                if s and ("rukminim" in s or "flixcart" in s) and "sprite" not in s:
-                    srcs.add(s.split("?")[0].split("._")[0])
-        # Fallback: only count images that appear in the first img-heavy block
-        if len(srcs) < 3:
-            all_imgs = soup.find_all("img")
-            # Find the first cluster of product images (consecutive imgs from same CDN)
-            for img in all_imgs[:30]:   # only look in first 30 imgs on page
-                for attr in ("src", "data-src"):
+        # ── Price + Availability + Images: use Schema.org JSON-LD (most reliable)
+        # Flipkart embeds structured data: {"@type":"Product","offers":{"price":1499,...}}
+        jsonld_price = None
+        jsonld_instock = None
+        jsonld_images = []
+        for item in _extract_jsonld(soup):
+            if item.get("@type") == "Product":
+                offers = item.get("offers", {})
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                p = offers.get("price")
+                try:
+                    p = int(float(p))
+                except (TypeError, ValueError):
+                    p = None
+                if p and 100 < p < _MAX_PRICE:
+                    jsonld_price = p
+                avail = str(offers.get("availability", ""))
+                if avail:
+                    jsonld_instock = "InStock" in avail
+                imgs = item.get("image", [])
+                if isinstance(imgs, str):
+                    imgs = [imgs]
+                jsonld_images = [s for s in imgs if isinstance(s, str) and "rukminim" in s]
+                break  # only need first Product schema
+
+        result["price"] = jsonld_price or _selling_price(soup.get_text())
+
+        # ── Images: prefer JSON-LD list (guaranteed product images), fallback HTML CDN scan
+        if jsonld_images:
+            result["images_count"] = len(jsonld_images)
+        else:
+            srcs = set()
+            for img in soup.find_all("img"):
+                for attr in ("src", "data-src", "data-lazy-src", "data-original"):
                     s = img.get(attr, "")
-                    if (s and s.startswith("http")
-                            and "sprite" not in s
-                            and "logo" not in s.lower()
-                            and "icon" not in s.lower()
-                            and ("rukminim" in s or "flixcart" in s)):
+                    if s and ("rukminim" in s or "flixcart" in s) and "sprite" not in s:
                         srcs.add(s.split("?")[0].split("._")[0])
-        # Cap at 12 — product pages rarely have more product images
-        result["images_count"] = min(len(srcs), 12)
+            result["images_count"] = min(len(srcs), 12)
 
-        # ── Price: use discount-context detection to skip ad prices
-        result["price"] = _selling_price(soup.get_text())
-
-        # ── Buy box: text-based, uses shared helper
-        buy_btn = _find_buy_button(soup)
+        # ── Buy box: check for exact buy-button text in any element (FK uses unstyled divs)
+        _BUY_EXACT = re.compile(
+            r"^(add to (cart|bag)|buy now|place order)$", re.I
+        )
+        _BUY_PARTIAL = re.compile(
+            r"add to (cart|bag)|buy now|buy at|place order", re.I
+        )
+        buy_btn = _find_buy_button(soup)   # checks <button> tags
         if not buy_btn:
-            for el in soup.find_all(["div", "span", "a"]):
-                if el.get("role") == "button" or el.get("tabindex") == "0":
-                    txt = _text(el).lower()
-                    if re.search(r"add to (cart|bag)|buy now|place order|buy at", txt):
-                        buy_btn = el
-                        break
+            for el in soup.find_all(["div", "span", "a", "button"]):
+                txt = _text(el).strip()
+                # Exact match: element whose entire text IS the buy action
+                if _BUY_EXACT.match(txt):
+                    buy_btn = el
+                    break
+                # Partial match only if element has button semantics
+                role = el.get("role", "")
+                tab  = el.get("tabindex", "")
+                if (role == "button" or tab == "0") and _BUY_PARTIAL.search(txt.lower()):
+                    buy_btn = el
+                    break
         result["buy_box"] = buy_btn is not None
 
-        # ── In stock: based on OOS signals only (not buy button presence)
-        # Flipkart/Myntra JS may not render the button but the product IS in stock
-        oos_found = False
-        for el in soup.find_all(["div", "span", "p", "h2", "h3", "button"]):
-            if el.find(["div", "span", "p"]):
-                continue
-            txt = _text(el).strip().lower()
-            if txt in ("out of stock", "currently unavailable", "sold out",
-                       "notify me", "coming soon"):
-                oos_found = True
-                break
-        result["in_stock"] = not oos_found
+        # ── In stock: JSON-LD first, then OOS signal scan
+        if jsonld_instock is not None:
+            result["in_stock"] = jsonld_instock
+        else:
+            oos_found = False
+            for el in soup.find_all(["div", "span", "p", "h2", "h3", "button"]):
+                if el.find(["div", "span", "p"]):
+                    continue
+                txt = _text(el).strip().lower()
+                if txt in ("out of stock", "currently unavailable", "sold out",
+                           "notify me", "coming soon"):
+                    oos_found = True
+                    break
+            result["in_stock"] = not oos_found
 
         # ── Sold by: scan for "Sold by" / "Fulfilled by" text nodes
         for node in soup.find_all(string=re.compile(r"(Sold|Fulfilled)\s+by", re.I)):
@@ -384,11 +440,11 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
                     result["sold_by"] = val
                     break
 
-        # ── Sizes: walk DOM from "Select Size" text; broad fallback if not found
+        # ── Sizes: Flipkart sizes are React-rendered and NOT in the static HTML.
+        # We attempt DOM walk (works if Zyte fully hydrates) but accept 0 if not found.
         sizes, sizes_unavailable = [], []
         size_container = None
 
-        # Method 1 — walk up from "Select Size" / "Size" label
         for pattern in (r"select\s+size", r"^size$"):
             for node in soup.find_all(string=re.compile(pattern, re.I)):
                 parent = node.find_parent()
@@ -406,26 +462,12 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
             if size_container:
                 break
 
-        # Method 2 — any ul/div whose li children are all valid sizes (≥ 3)
-        if not size_container:
-            for container in soup.find_all(["ul", "div"]):
-                lis = container.find_all("li", recursive=False) or container.find_all("li")
-                if len(lis) < 3:
-                    continue
-                vals = [_text(li).split("\n")[0].strip() for li in lis]
-                valid_count = sum(1 for v in vals if _is_valid_size(v))
-                # At least 80% of li children must look like real sizes
-                if valid_count >= 3 and valid_count / len(lis) >= 0.75:
-                    size_container = container
-                    break
-
         if size_container:
             for li in size_container.find_all("li"):
                 val = _text(li).split("\n")[0].strip()
                 if not val or not _is_valid_size(val):
                     continue
                 classes = " ".join(li.get("class") or [])
-                # Flipkart marks OOS sizes with _9E25nV or aria-disabled
                 is_unavail = (
                     "_9E25nV" in classes
                     or "disabled" in classes.lower()
@@ -438,7 +480,7 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
         result["sizes"]             = list(dict.fromkeys(sizes))
         result["sizes_unavailable"] = list(dict.fromkeys(sizes_unavailable))
 
-        # ── Colors: walk DOM from "Colour" / "Color" text
+        # ── Colors: walk DOM from "Colour"/"Color" label
         colors = []
         for node in soup.find_all(string=re.compile(r"^colou?r$", re.I)):
             parent = node.find_parent()
@@ -470,216 +512,163 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
 def parse_myntra_com(soup: BeautifulSoup) -> dict:
     result = _empty_result()
     try:
-        # ── Title: Myntra has Brand in h1, product name in the next element
-        h1_tags = soup.find_all("h1")
-        parts = [_text(h) for h in h1_tags if _text(h)]
-        if not parts:
-            # Try h2 as fallback
-            parts = [_text(h) for h in soup.find_all("h2") if _text(h)][:2]
-        if not parts:
-            pt = soup.find("title")
-            if pt:
-                parts = [_text(pt).split("|")[0].strip()]
-        title = " ".join(parts[:2]).strip()
-        result["title"]    = title
-        result["title_ok"] = _title_ok(title)
+        # ══════════════════════════════════════════════════════════
+        # PRIMARY SOURCE: window.__myx.pdpData (Myntra's React state)
+        # Contains: name, price, sizes[], colours[], sellers[]
+        # ══════════════════════════════════════════════════════════
+        myx = _extract_window_var(soup, "__myx")
+        pdp = myx.get("pdpData", {})
 
-        # ── Images: filter by Myntra's CDN domain — class-agnostic
+        if pdp:
+            # ── Title from pdpData
+            name = (pdp.get("name") or "").strip()
+            if name:
+                result["title"]    = name
+                result["title_ok"] = _title_ok(name)
+
+            # ── Price: pdpData.price = {"mrp": 3499, "discounted": 1499}
+            price_obj = pdp.get("price") or {}
+            if isinstance(price_obj, dict):
+                p = price_obj.get("discounted") or price_obj.get("mrp")
+                if p:
+                    try:
+                        result["price"] = int(float(p))
+                    except (TypeError, ValueError):
+                        pass
+            # Also try selectedSeller.discountedPrice
+            if not result["price"]:
+                sel_seller = pdp.get("selectedSeller") or {}
+                sp = sel_seller.get("discountedPrice")
+                if sp:
+                    try:
+                        result["price"] = int(float(sp))
+                    except (TypeError, ValueError):
+                        pass
+
+            # ── Sizes: pdpData.sizes[] = [{label:"6", available:true, ...}, ...]
+            sizes, sizes_unavailable = [], []
+            for s in pdp.get("sizes", []):
+                label = str(s.get("label", "")).strip()
+                if label and _is_valid_size(label):
+                    if s.get("available"):
+                        sizes.append(label)
+                    else:
+                        sizes_unavailable.append(label)
+            result["sizes"]            = list(dict.fromkeys(sizes))
+            result["sizes_unavailable"]= list(dict.fromkeys(sizes_unavailable))
+
+            # ── In stock + Buy box: if selectedSeller exists and any size available
+            has_seller  = bool(pdp.get("selectedSeller"))
+            has_stock   = bool(sizes)
+            result["in_stock"] = has_stock
+            result["buy_box"]  = has_seller and has_stock
+
+            # ── Seller: selectedSeller.sellerName or sellers[0].sellerName
+            sel = pdp.get("selectedSeller") or {}
+            seller_name = (sel.get("sellerName") or sel.get("displayName") or "").strip()
+            if not seller_name:
+                sellers = pdp.get("sellers") or []
+                if sellers:
+                    seller_name = (sellers[0].get("sellerName") or
+                                   sellers[0].get("displayName") or "").strip()
+            result["sold_by"] = seller_name or None
+
+            # ── Colors: pdpData.colours[] = [{label:"Olive", styleId:..., image:...}, ...]
+            colour_list = pdp.get("colours") or []
+            result["colors"] = [
+                c.get("label", "").strip()
+                for c in colour_list
+                if c.get("label", "").strip()
+            ]
+
+        # ══════════════════════════════════════════════════════════
+        # FALLBACKS (when pdpData not available / incomplete)
+        # ══════════════════════════════════════════════════════════
+
+        # ── Title fallback
+        if not result["title"]:
+            h1_tags = soup.find_all("h1")
+            parts = [_text(h) for h in h1_tags if _text(h)]
+            if not parts:
+                pt = soup.find("title")
+                if pt:
+                    parts = [_text(pt).split("|")[0].strip()]
+            title = " ".join(parts[:2]).strip()
+            result["title"]    = title
+            result["title_ok"] = _title_ok(title)
+
+        # ── Price fallback
+        if not result["price"]:
+            result["price"] = _selling_price(soup.get_text())
+
+        # ── Images: always from HTML (CDN scan)
         srcs = set()
         for img in soup.find_all("img"):
             for attr in ("src", "data-src", "data-lazy-src", "data-original"):
                 s = img.get(attr, "")
                 if s and "myntassets" in s and "logo" not in s.lower():
                     srcs.add(s.split("?")[0])
-        # Fallback: all myntassets images anywhere on page (they are product images)
-        if len(srcs) < 3:
-            for img in soup.find_all("img"):
-                for attr in ("src", "data-src", "data-lazy-src"):
-                    s = img.get(attr, "")
-                    if s and s.startswith("http") and "myntassets" in s and "logo" not in s.lower():
-                        srcs.add(s.split("?")[0])
         result["images_count"] = len(srcs)
 
-        # ── Price: use discount-context detection (skips ₹599 from other variants)
-        result["price"] = _selling_price(soup.get_text())
+        # ── HTML fallbacks for buy_box / in_stock / sold_by / colors
+        # (only used when pdpData wasn't available above)
 
-        # ── Buy box: text-based helpers; Myntra uses "Add to Bag" or "ADD TO BAG"
-        buy_btn = _find_buy_button(soup)
-        if not buy_btn:
-            for el in soup.find_all(["div", "span", "a", "button"]):
-                if el.get("role") in ("button", "link") or el.get("tabindex") == "0":
-                    txt = _text(el).lower()
-                    if re.search(r"add to (cart|bag)|buy now", txt):
+        if result["buy_box"] is False and result["in_stock"] is None:
+            # buy_box: Myntra renders "pdp-add-to-bag" div or "ADD TO BAG" text
+            buy_btn = soup.select_one("div.pdp-add-to-bag, button.pdp-add-to-bag")
+            if not buy_btn:
+                buy_btn = _find_buy_button(soup)
+            if not buy_btn:
+                for el in soup.find_all(["div", "span", "a", "button"]):
+                    txt = _text(el).strip()
+                    if re.fullmatch(r"add to (cart|bag)|buy now", txt, re.I):
                         buy_btn = el
                         break
-        result["buy_box"] = buy_btn is not None
+            result["buy_box"] = buy_btn is not None
 
-        # ── In stock: based on OOS signals only (not buy button presence)
-        oos_found = False
-        for el in soup.find_all(["div", "span", "p", "h4", "button"]):
-            if el.find(["div", "span", "p"]):
-                continue
-            txt = _text(el).strip().lower()
-            if txt in ("out of stock", "sold out", "notify me", "currently unavailable",
-                       "coming soon"):
-                oos_found = True
-                break
-        result["in_stock"] = not oos_found
-
-        # ── Sizes: walk DOM from "Select Size" or "Size" heading
-        sizes, sizes_unavailable = [], []
-        size_container = None
-
-        # Method 1 — walk up from "Select Size" / "Size:" label
-        for pattern in (r"select\s+size", r"size\s*:"):
-            for node in soup.find_all(string=re.compile(pattern, re.I)):
-                parent = node.find_parent()
-                for _ in range(12):
-                    if not parent:
-                        break
-                    candidates = [
-                        el for el in parent.find_all(["li", "button"])
-                        if 1 <= len(_text(el).strip()) <= 8
-                    ]
-                    if len(candidates) >= 2:
-                        size_container = parent
-                        break
-                    parent = parent.find_parent()
-                if size_container:
-                    break
-            if size_container:
-                break
-
-        # Method 2 — any ul/div whose children are all valid sizes (≥ 3)
-        if not size_container:
-            for container in soup.find_all(["ul", "div"]):
-                items = container.find_all(["li", "button"], recursive=False)
-                if not items:
-                    items = container.find_all(["li", "button"])
-                if len(items) < 3:
+            # in_stock: OOS signal scan
+            oos_found = False
+            for el in soup.find_all(["div", "span", "p", "h4", "button"]):
+                if el.find(["div", "span", "p"]):
                     continue
-                vals = [_text(it).split("\n")[0].strip() for it in items]
-                valid_count = sum(1 for v in vals if _is_valid_size(v))
-                if valid_count >= 3 and valid_count / len(items) >= 0.75:
-                    size_container = container
+                txt = _text(el).strip().lower()
+                if txt in ("out of stock", "sold out", "notify me",
+                           "currently unavailable", "coming soon"):
+                    oos_found = True
                     break
-
-        if size_container:
-            seen_vals = set()
-            for item in size_container.find_all(["li", "button"]):
-                val = _text(item).split("\n")[0].strip()
-                if not val or val in seen_vals or not _is_valid_size(val):
-                    continue
-                seen_vals.add(val)
-                classes     = " ".join(item.get("class") or [])
-                parent_li   = item.find_parent("li")
-                li_classes  = " ".join(parent_li.get("class") or []) if parent_li else ""
-                is_unavail  = (
-                    "size-buttons-size-out" in li_classes
-                    or "size-buttons-size-out" in classes
-                    or "unavailable" in classes.lower()
-                    or "unavailable" in li_classes.lower()
-                    or "disabled" in classes.lower()
-                    or item.get("disabled") is not None
-                    or item.get("aria-disabled") == "true"
-                )
-                (sizes_unavailable if is_unavail else sizes).append(val)
-
-        result["sizes"]             = list(dict.fromkeys(sizes))
-        result["sizes_unavailable"] = list(dict.fromkeys(sizes_unavailable))
-
-        # ── Sold by: Myntra products are typically "Sold by Myntra" or a marketplace seller
-        for node in soup.find_all(string=re.compile(r"(Sold|Fulfilled|Ships)\s+by", re.I)):
-            parent = node.find_parent()
-            a_tag  = parent.find("a") if parent else None
-            if a_tag:
-                result["sold_by"] = _text(a_tag).strip()
-                break
-            elif parent:
-                val = re.sub(r"(Sold|Fulfilled|Ships)\s+by\s*:?\s*", "", _text(parent), flags=re.I).strip()
-                if val and len(val) < 50:
-                    result["sold_by"] = val
-                    break
-        # Also check "Seller:" text pattern (Myntra shows "Seller: NEEMAN'S PRIVATE LIMITED")
-        def _clean_seller(s: str) -> str | None:
-            """Return seller name or None if it looks like a React/JS artifact."""
-            s = s.strip()
-            if not s or len(s) > 60:
-                return None
-            # Skip React server-render artifacts like "/react-text" or "<!-- -->"
-            if s.startswith("/") or s.startswith("<") or s.startswith("<!--"):
-                return None
-            # Skip pure digit/symbol strings
-            if re.match(r'^[\d\s\W]+$', s):
-                return None
-            return s or None
+            result["in_stock"] = not oos_found
 
         if not result["sold_by"]:
-            for node in soup.find_all(string=re.compile(r"^seller\s*:?\s*$", re.I)):
-                # Walk siblings to find the actual name (skip React markers)
-                sibling = node.find_next(string=True)
-                while sibling:
-                    val = _clean_seller(sibling)
-                    if val:
+            # HTML seller scan
+            for node in soup.find_all(string=re.compile(r"(Sold|Fulfilled|Ships)\s+by", re.I)):
+                parent = node.find_parent()
+                a_tag  = parent.find("a") if parent else None
+                if a_tag:
+                    result["sold_by"] = _text(a_tag).strip()
+                    break
+                elif parent:
+                    val = re.sub(r"(Sold|Fulfilled|Ships)\s+by\s*:?\s*",
+                                 "", _text(parent), flags=re.I).strip()
+                    if val and len(val) < 50 and not val.startswith("/"):
                         result["sold_by"] = val
                         break
-                    sibling = sibling.find_next(string=True)
-                if result["sold_by"]:
-                    break
-        if not result["sold_by"]:
-            # Scan for "Seller: X" in a single text node
-            for node in soup.find_all(string=re.compile(r"seller\s*:", re.I)):
-                val = re.sub(r"seller\s*:\s*", "", str(node), flags=re.I).strip()
-                val = _clean_seller(val)
-                if val:
-                    result["sold_by"] = val
-                    break
 
-        # ── Colors: look for "MORE COLORS" section (Myntra's typical heading)
-        # or walk from "Colour"/"Color" label but validate each value
-        colors = []
-        # Try "MORE COLORS" heading first
-        for heading in soup.find_all(string=re.compile(r"more\s+colou?rs?", re.I)):
-            parent = heading.find_parent()
-            for _ in range(5):
-                if not parent:
-                    break
-                imgs = parent.find_all("img")
-                lis  = parent.find_all("li")
-                if imgs or len(lis) >= 1:
-                    break
-                parent = parent.find_parent()
-            if parent:
-                for img in parent.find_all("img"):
-                    alt = img.get("alt", "").strip()
-                    if alt and len(alt) < 30 and not _INVALID_COLOR_WORDS.search(alt):
-                        colors.append(alt)
-                if not colors:
-                    for li in parent.find_all("li"):
-                        val = li.get("title") or li.get("aria-label") or _text(li)
-                        if val and len(val.strip()) < 30 and not _INVALID_COLOR_WORDS.search(val):
-                            colors.append(val.strip())
-                break
-
-        # Fallback: walk from "Colour"/"Color" label but validate
-        if not colors:
-            for node in soup.find_all(string=re.compile(r"^colou?r$", re.I)):
-                parent = node.find_parent()
-                for _ in range(6):
+        if not result["colors"]:
+            # HTML color scan — "MORE COLORS" heading, then "Colour" label
+            for heading in soup.find_all(string=re.compile(r"more\s+colou?rs?", re.I)):
+                parent = heading.find_parent()
+                for _ in range(5):
                     if not parent:
                         break
-                    lis = parent.find_all("li")
-                    if len(lis) >= 1:
+                    if parent.find_all("img") or parent.find_all("li"):
                         break
                     parent = parent.find_parent()
                 if parent:
-                    for li in parent.find_all("li"):
-                        val = li.get("title") or li.get("aria-label") or _text(li)
-                        val = (val or "").strip()
-                        if val and len(val) < 30 and not _INVALID_COLOR_WORDS.search(val):
-                            colors.append(val)
-                break
-        result["colors"] = colors
+                    for img in parent.find_all("img"):
+                        alt = img.get("alt", "").strip()
+                        if alt and len(alt) < 30 and not _INVALID_COLOR_WORDS.search(alt):
+                            result["colors"].append(alt)
+                    break
 
         result["error"] = None
     except Exception as exc:
