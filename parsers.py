@@ -74,13 +74,15 @@ def _selling_price(text: str) -> int | None:
         p = _clean_price(m.group(1))
         if _valid(p):
             return p
-    # Strategy 2 — price immediately before "% off"
+    # Strategy 2 — price CLOSEST to "% off" (= selling price; MRP appears further left)
+    # Flipkart layout: "₹2,999  ₹1,499  50% off" → take the LAST price before % off
     for m in re.finditer(r"\d+\s*%\s*(?:off|OFF|Off)", text):
-        lookback = text[max(0, m.start() - 300): m.start()]
-        for pm in re.finditer(r"₹\s*([\d,]+)", lookback):
-            p = _clean_price(pm.group(1))
-            if _valid(p):
-                return p
+        lookback = text[max(0, m.start() - 400): m.start()]
+        candidates = [_clean_price(pm.group(1))
+                      for pm in re.finditer(r"₹\s*([\d,]+)", lookback)]
+        candidates = [p for p in candidates if _valid(p)]
+        if candidates:
+            return candidates[-1]   # last = closest to "% off" = selling price
     # Strategy 3 — skip first hit (often an ad), take next sensible price
     hits = [(m.start(), _clean_price(m.group(1)))
             for m in re.finditer(r"₹\s*([\d,]+)", text)]
@@ -174,32 +176,59 @@ def parse_amazon_in(soup: BeautifulSoup) -> dict:
         sizes, sizes_unavailable = [], []
 
         def _extract_amazon_sizes(soup):
-            """Try multiple Amazon size-picker selectors in priority order."""
+            """
+            Try multiple Amazon size-picker selectors in priority order.
+            Amazon uses several widget styles: twister (ul/li), dropdown, swatch grid.
+            """
             candidates = []
-            # 1. Primary: twister variation list (most Amazon products)
-            for li in soup.select("#variation_size_name ul li, #variation_size_name li"):
-                raw = li.get("data-value") or li.get("data-dp-url") or ""
-                val = re.sub(r"[_\-]", " ", raw).strip()
-                if not val:
-                    span = li.find("span", class_=re.compile(r"a-size|a-text", re.I))
-                    val = _text(span or li).split("\n")[0].strip()
-                candidates.append((li, val))
-            # 2. Dropdown fallback
+
+            # 1. Primary: twister variation (standard + shoe-specific IDs)
+            variation_div = soup.find(
+                id=re.compile(r"variation_size|variation_shoe_size", re.I)
+            )
+            if variation_div:
+                # Try li elements with data-value first
+                for li in variation_div.find_all("li"):
+                    raw = li.get("data-value") or ""
+                    val = re.sub(r"[_\-]", " ", raw).strip()
+                    if not val:
+                        # span inside button inside li
+                        span = li.find("span", class_=re.compile(r"a-button-text|a-size", re.I))
+                        val = _text(span).strip() if span else _text(li).split("\n")[0].strip()
+                    candidates.append((li, val))
+                # Also try input[type=radio] inside the div (swatch style)
+                if not candidates:
+                    for inp in variation_div.find_all("input", type="radio"):
+                        raw = inp.get("data-value") or inp.get("value") or ""
+                        val = re.sub(r"[_\-]", " ", raw).strip()
+                        if not val:
+                            label = soup.find("label", attrs={"for": inp.get("id", "__none__")})
+                            val = _text(label).strip() if label else ""
+                        candidates.append((inp, val))
+
+            # 2. Dropdown option list
             if not candidates:
-                for opt in soup.select("#native_dropdown_selected_size_name option"):
-                    val = re.sub(r"[_\-]", " ", opt.get("value", "")).strip() or _text(opt).strip()
-                    candidates.append((opt, val))
-            # 3. Size buttons (some listings use button grid)
+                for sel_el in soup.select(
+                    "#native_dropdown_selected_size_name option, "
+                    "select[name*='size' i] option"
+                ):
+                    raw = sel_el.get("value", "")
+                    val = re.sub(r"[_\-]", " ", raw).strip() or _text(sel_el).strip()
+                    candidates.append((sel_el, val))
+
+            # 3. Any button with data-value that looks like a size (broad fallback)
             if not candidates:
-                for btn in soup.select("button[data-value], button[aria-label*='size' i]"):
-                    val = re.sub(r"[_\-]", " ", btn.get("data-value", "")).strip() or \
-                          _text(btn).split("\n")[0].strip()
+                for btn in soup.find_all("button", attrs={"data-value": True}):
+                    raw = btn.get("data-value", "")
+                    val = re.sub(r"[_\-]", " ", raw).strip()
                     candidates.append((btn, val))
+
             return candidates
 
+        _SKIP_SIZE_VALS = {"", "select", "-1", "size", "please select", "select size"}
         for el, val in _extract_amazon_sizes(soup):
             val = re.sub(r"\s+", " ", val).strip()
-            if not val or val.lower() in ("", "select", "-1", "size", "please select"):
+            if not val or val.lower() in _SKIP_SIZE_VALS:
                 continue
             if not _is_valid_size(val):
                 continue
@@ -355,22 +384,40 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
                     result["sold_by"] = val
                     break
 
-        # ── Sizes: walk DOM from "Select Size" text upward to find the size list
+        # ── Sizes: walk DOM from "Select Size" text; broad fallback if not found
         sizes, sizes_unavailable = [], []
         size_container = None
-        for node in soup.find_all(string=re.compile(r"select\s+size", re.I)):
-            parent = node.find_parent()
-            for _ in range(10):
-                if not parent:
+
+        # Method 1 — walk up from "Select Size" / "Size" label
+        for pattern in (r"select\s+size", r"^size$"):
+            for node in soup.find_all(string=re.compile(pattern, re.I)):
+                parent = node.find_parent()
+                for _ in range(12):
+                    if not parent:
+                        break
+                    short_lis = [li for li in parent.find_all("li")
+                                 if 1 <= len(_text(li).split("\n")[0].strip()) <= 8]
+                    if len(short_lis) >= 2:
+                        size_container = parent
+                        break
+                    parent = parent.find_parent()
+                if size_container:
                     break
-                short_lis = [li for li in parent.find_all("li")
-                             if 1 <= len(_text(li).strip()) <= 6]
-                if len(short_lis) >= 2:
-                    size_container = parent
-                    break
-                parent = parent.find_parent()
             if size_container:
                 break
+
+        # Method 2 — any ul/div whose li children are all valid sizes (≥ 3)
+        if not size_container:
+            for container in soup.find_all(["ul", "div"]):
+                lis = container.find_all("li", recursive=False) or container.find_all("li")
+                if len(lis) < 3:
+                    continue
+                vals = [_text(li).split("\n")[0].strip() for li in lis]
+                valid_count = sum(1 for v in vals if _is_valid_size(v))
+                # At least 80% of li children must look like real sizes
+                if valid_count >= 3 and valid_count / len(lis) >= 0.75:
+                    size_container = container
+                    break
 
         if size_container:
             for li in size_container.find_all("li"):
@@ -482,27 +529,45 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
         # ── Sizes: walk DOM from "Select Size" or "Size" heading
         sizes, sizes_unavailable = [], []
         size_container = None
-        for node in soup.find_all(string=re.compile(r"select\s+size|size\s*:", re.I)):
-            parent = node.find_parent()
-            for _ in range(10):
-                if not parent:
+
+        # Method 1 — walk up from "Select Size" / "Size:" label
+        for pattern in (r"select\s+size", r"size\s*:"):
+            for node in soup.find_all(string=re.compile(pattern, re.I)):
+                parent = node.find_parent()
+                for _ in range(12):
+                    if not parent:
+                        break
+                    candidates = [
+                        el for el in parent.find_all(["li", "button"])
+                        if 1 <= len(_text(el).strip()) <= 8
+                    ]
+                    if len(candidates) >= 2:
+                        size_container = parent
+                        break
+                    parent = parent.find_parent()
+                if size_container:
                     break
-                candidates = [
-                    el for el in parent.find_all(["li", "button"])
-                    if 1 <= len(_text(el).strip()) <= 6
-                ]
-                if len(candidates) >= 2:
-                    size_container = parent
-                    break
-                parent = parent.find_parent()
             if size_container:
                 break
+
+        # Method 2 — any ul/div whose children are all valid sizes (≥ 3)
+        if not size_container:
+            for container in soup.find_all(["ul", "div"]):
+                items = container.find_all(["li", "button"], recursive=False)
+                if not items:
+                    items = container.find_all(["li", "button"])
+                if len(items) < 3:
+                    continue
+                vals = [_text(it).split("\n")[0].strip() for it in items]
+                valid_count = sum(1 for v in vals if _is_valid_size(v))
+                if valid_count >= 3 and valid_count / len(items) >= 0.75:
+                    size_container = container
+                    break
 
         if size_container:
             seen_vals = set()
             for item in size_container.find_all(["li", "button"]):
                 val = _text(item).split("\n")[0].strip()
-                # Only accept values that look like real sizes
                 if not val or val in seen_vals or not _is_valid_size(val):
                     continue
                 seen_vals.add(val)
