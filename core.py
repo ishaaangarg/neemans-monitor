@@ -57,13 +57,11 @@ def fetch_html_zyte(url: str, save_debug: bool = True) -> tuple[str | None, str 
     payload = {
         "url":         url,
         "browserHtml": True,
-        "geolocation": "IN",       # serve Indian version of the page
-        "javascript":  True,       # wait for JS hydration
-        "actions": [               # scroll down to trigger lazy-loads
-            {"action": "waitForTimeout", "timeout": 3},
-            {"action": "scrollY", "y": 800},
-            {"action": "waitForTimeout", "timeout": 2},
-        ],
+        "geolocation": "IN",   # serve Indian version of the page
+        # Scroll mid-page after load to trigger lazy-loaded images & size pickers
+        "javascript":  (
+            "window.scrollTo(0, Math.min(1200, document.body.scrollHeight / 2));"
+        ),
     }
     try:
         resp = requests.post(
@@ -298,7 +296,9 @@ def compute_flags(results: list[dict]) -> list[dict]:
         else:
             r["status"] = "RED"
 
-        critical = ("OUT OF STOCK", "NOT PURCHASABLE", "PARSE ERROR", "FETCH ERROR")
+        # NOT PURCHASABLE is excluded from critical: buy-button detection is unreliable
+        # on JS-heavy pages (Flipkart/Myntra) — only hard OOS or errors force RED
+        critical = ("OUT OF STOCK", "PARSE ERROR", "FETCH ERROR")
         if any(any(c in f for c in critical) for f in r["flags"]):
             r["status"] = "RED"
 

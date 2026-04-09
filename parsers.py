@@ -56,30 +56,35 @@ def _is_valid_size(val: str) -> bool:
     v = re.sub(r"[_\-]", " ", val.strip())
     return bool(_SIZE_RE.match(v))
 
+_MAX_PRICE = 50_000   # sanity cap — no shoe costs more than ₹50k
+
 def _selling_price(text: str) -> int | None:
     """
     Extract the selling (discounted) price from page text.
     Strategy 1: '₹PRICE MRP'  (Myntra style)
     Strategy 2: price that appears just before '% OFF'
-    Strategy 3: skip first ₹ occurrence (often an ad), return next > 100
+    Strategy 3: skip first ₹ occurrence (often an ad), return next in range
     """
+    def _valid(p):
+        return p is not None and 100 < p < _MAX_PRICE
+
     # Strategy 1 — Myntra "₹1499 MRP ₹3499"
     m = re.search(r"₹\s*([\d,]+)\s*MRP", text, re.I)
     if m:
         p = _clean_price(m.group(1))
-        if p and p > 100:
+        if _valid(p):
             return p
     # Strategy 2 — price immediately before "% off"
     for m in re.finditer(r"\d+\s*%\s*(?:off|OFF|Off)", text):
         lookback = text[max(0, m.start() - 300): m.start()]
         for pm in re.finditer(r"₹\s*([\d,]+)", lookback):
             p = _clean_price(pm.group(1))
-            if p and p > 100:
+            if _valid(p):
                 return p
-    # Strategy 3 — skip first hit (ads), take second occurrence
+    # Strategy 3 — skip first hit (often an ad), take next sensible price
     hits = [(m.start(), _clean_price(m.group(1)))
             for m in re.finditer(r"₹\s*([\d,]+)", text)]
-    hits = [(pos, p) for pos, p in hits if p and p > 100]
+    hits = [(pos, p) for pos, p in hits if _valid(p)]
     if len(hits) >= 2:
         return hits[1][1]
     elif hits:
@@ -88,8 +93,9 @@ def _selling_price(text: str) -> int | None:
 
 # Words that should NOT appear in a valid colour name
 _INVALID_COLOR_WORDS = re.compile(
-    r"\b(off|selected|description|caption|chapter|play|pause|muted|volume|menu|"
-    r"button|click|image|video|audio|track|subtitle|fullscreen|settings)\b",
+    r"\b(off|selected|description|caption|chapters?|play|pause|muted|volume|menu|"
+    r"button|click|image|video|audio|tracks?|subtitles?|fullscreen|settings|"
+    r"captions?|thumbnails?|seekbar|buffered|autoplay|controls?|loop|preload)\b",
     re.I,
 )
 
@@ -166,29 +172,45 @@ def parse_amazon_in(soup: BeautifulSoup) -> dict:
 
         # ── Sizes — split available vs unavailable
         sizes, sizes_unavailable = [], []
-        for li in soup.select(
-            "#variation_size_name ul li, "
-            "#native_dropdown_selected_size_name option"
-        ):
-            # data-value may be "6 UK", "6UK", "6_UK", or the li text may say "6 UK"
-            raw = li.get("data-value") or ""
-            # Normalise: replace _ or - with space
-            val = re.sub(r"[_\-]", " ", raw).strip()
-            if not val:
-                # Extract just the size text from li (first span or direct text)
-                span = li.find("span", class_=re.compile(r"a-size|a-text", re.I))
-                val = _text(span or li).split("\n")[0].strip()
-            if not val or val.lower() in ("", "select", "-1", "size"):
+
+        def _extract_amazon_sizes(soup):
+            """Try multiple Amazon size-picker selectors in priority order."""
+            candidates = []
+            # 1. Primary: twister variation list (most Amazon products)
+            for li in soup.select("#variation_size_name ul li, #variation_size_name li"):
+                raw = li.get("data-value") or li.get("data-dp-url") or ""
+                val = re.sub(r"[_\-]", " ", raw).strip()
+                if not val:
+                    span = li.find("span", class_=re.compile(r"a-size|a-text", re.I))
+                    val = _text(span or li).split("\n")[0].strip()
+                candidates.append((li, val))
+            # 2. Dropdown fallback
+            if not candidates:
+                for opt in soup.select("#native_dropdown_selected_size_name option"):
+                    val = re.sub(r"[_\-]", " ", opt.get("value", "")).strip() or _text(opt).strip()
+                    candidates.append((opt, val))
+            # 3. Size buttons (some listings use button grid)
+            if not candidates:
+                for btn in soup.select("button[data-value], button[aria-label*='size' i]"):
+                    val = re.sub(r"[_\-]", " ", btn.get("data-value", "")).strip() or \
+                          _text(btn).split("\n")[0].strip()
+                    candidates.append((btn, val))
+            return candidates
+
+        for el, val in _extract_amazon_sizes(soup):
+            val = re.sub(r"\s+", " ", val).strip()
+            if not val or val.lower() in ("", "select", "-1", "size", "please select"):
                 continue
             if not _is_valid_size(val):
                 continue
-            val = re.sub(r"\s+", " ", val)   # normalise whitespace
-            classes = " ".join(li.get("class") or [])
+            classes  = " ".join(el.get("class") or [])
+            el_text  = _text(el).lower()
             is_unavail = (
                 "a-disabled" in classes
-                or li.get("aria-disabled") == "true"
-                or bool(li.find(class_=re.compile(r"a-disabled|cross-icon|unavailable", re.I)))
-                or "currently unavailable" in _text(li).lower()
+                or el.get("aria-disabled") == "true"
+                or el.get("disabled") is not None
+                or bool(el.find(class_=re.compile(r"a-disabled|cross-icon|unavailable", re.I)))
+                or "currently unavailable" in el_text
             )
             (sizes_unavailable if is_unavail else sizes).append(val)
         result["sizes"] = list(dict.fromkeys(sizes))
@@ -514,17 +536,37 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
                     result["sold_by"] = val
                     break
         # Also check "Seller:" text pattern (Myntra shows "Seller: NEEMAN'S PRIVATE LIMITED")
+        def _clean_seller(s: str) -> str | None:
+            """Return seller name or None if it looks like a React/JS artifact."""
+            s = s.strip()
+            if not s or len(s) > 60:
+                return None
+            # Skip React server-render artifacts like "/react-text" or "<!-- -->"
+            if s.startswith("/") or s.startswith("<") or s.startswith("<!--"):
+                return None
+            # Skip pure digit/symbol strings
+            if re.match(r'^[\d\s\W]+$', s):
+                return None
+            return s or None
+
         if not result["sold_by"]:
             for node in soup.find_all(string=re.compile(r"^seller\s*:?\s*$", re.I)):
+                # Walk siblings to find the actual name (skip React markers)
                 sibling = node.find_next(string=True)
-                if sibling and len(sibling.strip()) < 60:
-                    result["sold_by"] = sibling.strip()
+                while sibling:
+                    val = _clean_seller(sibling)
+                    if val:
+                        result["sold_by"] = val
+                        break
+                    sibling = sibling.find_next(string=True)
+                if result["sold_by"]:
                     break
         if not result["sold_by"]:
             # Scan for "Seller: X" in a single text node
             for node in soup.find_all(string=re.compile(r"seller\s*:", re.I)):
                 val = re.sub(r"seller\s*:\s*", "", str(node), flags=re.I).strip()
-                if val and len(val) < 60:
+                val = _clean_seller(val)
+                if val:
                     result["sold_by"] = val
                     break
 
