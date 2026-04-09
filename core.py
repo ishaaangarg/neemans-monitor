@@ -32,7 +32,7 @@ SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 ZYTE_API_URL    = "https://api.zyte.com/v1/extract"
 REQUEST_TIMEOUT = 120  # Zyte browser rendering can be slower
 
-MIN_IMAGES      = 5
+MIN_IMAGES      = 3
 MIN_TITLE_WORDS = 5
 
 # Folder where raw HTML dumps are saved for debugging
