@@ -588,13 +588,19 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
                                    sellers[0].get("displayName") or "").strip()
             result["sold_by"] = seller_name or None
 
-            # ── Colors: pdpData.colours[] = [{label:"Olive", styleId:..., image:...}, ...]
+            # ── Colors: pdpData.colours[] lists OTHER colorways (not the current one).
+            # pdpData.baseColour = the current product's color (e.g. "Grey").
+            # Combine: current color first, then other variants.
+            base_colour = (pdp.get("baseColour") or "").strip()
             colour_list = pdp.get("colours") or []
-            result["colors"] = [
-                c.get("label", "").strip()
-                for c in colour_list
-                if c.get("label", "").strip()
-            ]
+            other_colours = [c.get("label", "").strip() for c in colour_list if c.get("label", "").strip()]
+            all_colours = []
+            if base_colour:
+                all_colours.append(base_colour)
+            for c in other_colours:
+                if c not in all_colours:
+                    all_colours.append(c)
+            result["colors"] = all_colours
 
         # ══════════════════════════════════════════════════════════
         # FALLBACKS (when pdpData not available / incomplete)

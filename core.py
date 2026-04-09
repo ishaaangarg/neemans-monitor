@@ -271,8 +271,13 @@ def compute_flags(results: list[dict]) -> list[dict]:
                     break
 
     # ── Missing sizes across platforms
+    # Normalise to numeric-only before comparing so "6 UK" == "6" == "6 EU"
+    def _norm_size(s: str) -> str:
+        import re as _re
+        return _re.sub(r"\s*(UK|US|EU|IN|CM)\s*$", "", s.strip(), flags=_re.I).strip()
+
     parseable = {
-        r["platform"]: set(r["sizes"])
+        r["platform"]: set(_norm_size(s) for s in r["sizes"])
         for r in valid
         if r["sizes"] and r["sizes"] != ["Could not parse"]
     }
@@ -282,7 +287,9 @@ def compute_flags(results: list[dict]) -> list[dict]:
             if r["platform"] in parseable:
                 missing = all_sizes - parseable[r["platform"]]
                 if missing:
-                    r["flags"].append(f"MISSING SIZES on {r['platform']}: {', '.join(sorted(missing))}")
+                    r["flags"].append(
+                        f"MISSING SIZES on {r['platform']}: {', '.join(sorted(missing, key=lambda x: float(x) if x.replace('.','').isdigit() else 99))}"
+                    )
 
     # ── Status assignment
     for r in results:
