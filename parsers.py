@@ -52,7 +52,46 @@ _SIZE_RE = re.compile(
 
 def _is_valid_size(val: str) -> bool:
     """Return True only if val looks like an actual size (not a category/brand name)."""
-    return bool(_SIZE_RE.match(val.strip()))
+    # Also normalise common Amazon data-value formats like "10_UK" → "10 UK"
+    v = re.sub(r"[_\-]", " ", val.strip())
+    return bool(_SIZE_RE.match(v))
+
+def _selling_price(text: str) -> int | None:
+    """
+    Extract the selling (discounted) price from page text.
+    Strategy 1: '₹PRICE MRP'  (Myntra style)
+    Strategy 2: price that appears just before '% OFF'
+    Strategy 3: skip first ₹ occurrence (often an ad), return next > 100
+    """
+    # Strategy 1 — Myntra "₹1499 MRP ₹3499"
+    m = re.search(r"₹\s*([\d,]+)\s*MRP", text, re.I)
+    if m:
+        p = _clean_price(m.group(1))
+        if p and p > 100:
+            return p
+    # Strategy 2 — price immediately before "% off"
+    for m in re.finditer(r"\d+\s*%\s*(?:off|OFF|Off)", text):
+        lookback = text[max(0, m.start() - 300): m.start()]
+        for pm in re.finditer(r"₹\s*([\d,]+)", lookback):
+            p = _clean_price(pm.group(1))
+            if p and p > 100:
+                return p
+    # Strategy 3 — skip first hit (ads), take second occurrence
+    hits = [(m.start(), _clean_price(m.group(1)))
+            for m in re.finditer(r"₹\s*([\d,]+)", text)]
+    hits = [(pos, p) for pos, p in hits if p and p > 100]
+    if len(hits) >= 2:
+        return hits[1][1]
+    elif hits:
+        return hits[0][1]
+    return None
+
+# Words that should NOT appear in a valid colour name
+_INVALID_COLOR_WORDS = re.compile(
+    r"\b(off|selected|description|caption|chapter|play|pause|muted|volume|menu|"
+    r"button|click|image|video|audio|track|subtitle|fullscreen|settings)\b",
+    re.I,
+)
 
 def _empty_result(error: str | None = None) -> dict:
     return {
@@ -131,13 +170,20 @@ def parse_amazon_in(soup: BeautifulSoup) -> dict:
             "#variation_size_name ul li, "
             "#native_dropdown_selected_size_name option"
         ):
-            val = (li.get("data-value") or _text(li) or "").strip()
+            # data-value may be "6 UK", "6UK", "6_UK", or the li text may say "6 UK"
+            raw = li.get("data-value") or ""
+            # Normalise: replace _ or - with space
+            val = re.sub(r"[_\-]", " ", raw).strip()
+            if not val:
+                # Extract just the size text from li (first span or direct text)
+                span = li.find("span", class_=re.compile(r"a-size|a-text", re.I))
+                val = _text(span or li).split("\n")[0].strip()
             if not val or val.lower() in ("", "select", "-1", "size"):
                 continue
             if not _is_valid_size(val):
                 continue
+            val = re.sub(r"\s+", " ", val)   # normalise whitespace
             classes = " ".join(li.get("class") or [])
-            # Unavailable = a-disabled class OR aria-disabled OR contains unavailable child
             is_unavail = (
                 "a-disabled" in classes
                 or li.get("aria-disabled") == "true"
@@ -231,56 +277,48 @@ def parse_flipkart_com(soup: BeautifulSoup) -> dict:
                 s = img.get(attr, "")
                 if s and ("rukminim" in s or "flixcart" in s) and "sprite" not in s:
                     srcs.add(s.split("?")[0].split("._")[0])
-        # Fallback: look in main product container only (not whole page)
+        # Fallback: only count images that appear in the first img-heavy block
         if len(srcs) < 3:
-            # Try to scope to the left-hand image column — typically the first large div
-            for container_sel in [
-                "div[class*='_3qGmHb']", "div[class*='_2r_T1I']",
-                "div[class*='CXW8mj']",  "div[class*='q6DClP']",
-                "div[data-testid*='image']",
-            ]:
-                container = soup.select_one(container_sel)
-                if container:
-                    for img in container.find_all("img"):
-                        for attr in ("src", "data-src"):
-                            s = img.get(attr, "")
-                            if s and s.startswith("http") and "sprite" not in s:
-                                srcs.add(s.split("?")[0].split("._")[0])
-                    if len(srcs) >= 3:
-                        break
-        result["images_count"] = len(srcs)
+            all_imgs = soup.find_all("img")
+            # Find the first cluster of product images (consecutive imgs from same CDN)
+            for img in all_imgs[:30]:   # only look in first 30 imgs on page
+                for attr in ("src", "data-src"):
+                    s = img.get(attr, "")
+                    if (s and s.startswith("http")
+                            and "sprite" not in s
+                            and "logo" not in s.lower()
+                            and "icon" not in s.lower()
+                            and ("rukminim" in s or "flixcart" in s)):
+                        srcs.add(s.split("?")[0].split("._")[0])
+        # Cap at 12 — product pages rarely have more product images
+        result["images_count"] = min(len(srcs), 12)
 
-        # ── Price: ₹ regex scan — immune to class-name changes
-        price = None
-        for m in re.finditer(r"₹\s*([\d,]+)", soup.get_text()):
-            p = _clean_price(m.group(1))
-            if p and p > 100:
-                price = p
-                break
-        result["price"] = price
+        # ── Price: use discount-context detection to skip ad prices
+        result["price"] = _selling_price(soup.get_text())
 
         # ── Buy box: text-based, uses shared helper
         buy_btn = _find_buy_button(soup)
-        # Also accept div/span acting as button
         if not buy_btn:
             for el in soup.find_all(["div", "span", "a"]):
                 if el.get("role") == "button" or el.get("tabindex") == "0":
                     txt = _text(el).lower()
-                    if re.search(r"add to (cart|bag)|buy now|place order", txt):
+                    if re.search(r"add to (cart|bag)|buy now|place order|buy at", txt):
                         buy_btn = el
                         break
         result["buy_box"] = buy_btn is not None
 
-        # ── In stock: exact-text match on small elements (avoids review false positives)
+        # ── In stock: based on OOS signals only (not buy button presence)
+        # Flipkart/Myntra JS may not render the button but the product IS in stock
         oos_found = False
-        for el in soup.find_all(["div", "span", "p", "h2", "h3"]):
-            if el.find(["div", "span", "p"]):  # skip containers
+        for el in soup.find_all(["div", "span", "p", "h2", "h3", "button"]):
+            if el.find(["div", "span", "p"]):
                 continue
             txt = _text(el).strip().lower()
-            if txt in ("out of stock", "currently unavailable", "sold out"):
+            if txt in ("out of stock", "currently unavailable", "sold out",
+                       "notify me", "coming soon"):
                 oos_found = True
                 break
-        result["in_stock"] = not oos_found and result["buy_box"]
+        result["in_stock"] = not oos_found
 
         # ── Sold by: scan for "Sold by" / "Fulfilled by" text nodes
         for node in soup.find_all(string=re.compile(r"(Sold|Fulfilled)\s+by", re.I)):
@@ -384,55 +422,40 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
                 s = img.get(attr, "")
                 if s and "myntassets" in s and "logo" not in s.lower():
                     srcs.add(s.split("?")[0])
-        # Fallback: scope to the product image column, not the entire page
+        # Fallback: all myntassets images anywhere on page (they are product images)
         if len(srcs) < 3:
-            for container_sel in [
-                "div[class*='image-grid']", "div[class*='ImageGrid']",
-                "ul[class*='image-grid']", "div[class*='pdp-images']",
-                "div[class*='product-image']",
-            ]:
-                container = soup.select_one(container_sel)
-                if container:
-                    for img in container.find_all("img"):
-                        for attr in ("src", "data-src"):
-                            s = img.get(attr, "")
-                            if s and s.startswith("http") and "sprite" not in s and "logo" not in s.lower():
-                                srcs.add(s.split("?")[0])
-                    if len(srcs) >= 3:
-                        break
+            for img in soup.find_all("img"):
+                for attr in ("src", "data-src", "data-lazy-src"):
+                    s = img.get(attr, "")
+                    if s and s.startswith("http") and "myntassets" in s and "logo" not in s.lower():
+                        srcs.add(s.split("?")[0])
         result["images_count"] = len(srcs)
 
-        # ── Price: ₹ regex scan — immune to class-name changes
-        price = None
-        for m in re.finditer(r"₹\s*([\d,]+)", soup.get_text()):
-            p = _clean_price(m.group(1))
-            if p and p > 100:
-                price = p
-                break
-        result["price"] = price
+        # ── Price: use discount-context detection (skips ₹599 from other variants)
+        result["price"] = _selling_price(soup.get_text())
 
-        # ── Buy box: text-based helpers; Myntra uses "Add to Bag"
-        buy_btn = _find_buy_button(soup)   # catches "add to bag" via regex
-        # Also try div/span with role=button
+        # ── Buy box: text-based helpers; Myntra uses "Add to Bag" or "ADD TO BAG"
+        buy_btn = _find_buy_button(soup)
         if not buy_btn:
-            for el in soup.find_all(["div", "span", "a"]):
-                if el.get("role") == "button":
+            for el in soup.find_all(["div", "span", "a", "button"]):
+                if el.get("role") in ("button", "link") or el.get("tabindex") == "0":
                     txt = _text(el).lower()
                     if re.search(r"add to (cart|bag)|buy now", txt):
                         buy_btn = el
                         break
         result["buy_box"] = buy_btn is not None
 
-        # ── In stock: exact-text match on leaf elements only
+        # ── In stock: based on OOS signals only (not buy button presence)
         oos_found = False
         for el in soup.find_all(["div", "span", "p", "h4", "button"]):
             if el.find(["div", "span", "p"]):
-                continue  # skip containers
+                continue
             txt = _text(el).strip().lower()
-            if txt in ("out of stock", "sold out", "notify me", "currently unavailable"):
+            if txt in ("out of stock", "sold out", "notify me", "currently unavailable",
+                       "coming soon"):
                 oos_found = True
                 break
-        result["in_stock"] = not oos_found and result["buy_box"]
+        result["in_stock"] = not oos_found
 
         # ── Sizes: walk DOM from "Select Size" or "Size" heading
         sizes, sizes_unavailable = [], []
@@ -490,25 +513,64 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
                 if val and len(val) < 50:
                     result["sold_by"] = val
                     break
+        # Also check "Seller:" text pattern (Myntra shows "Seller: NEEMAN'S PRIVATE LIMITED")
         if not result["sold_by"]:
-            result["sold_by"] = "Myntra"   # Myntra is always the seller
+            for node in soup.find_all(string=re.compile(r"^seller\s*:?\s*$", re.I)):
+                sibling = node.find_next(string=True)
+                if sibling and len(sibling.strip()) < 60:
+                    result["sold_by"] = sibling.strip()
+                    break
+        if not result["sold_by"]:
+            # Scan for "Seller: X" in a single text node
+            for node in soup.find_all(string=re.compile(r"seller\s*:", re.I)):
+                val = re.sub(r"seller\s*:\s*", "", str(node), flags=re.I).strip()
+                if val and len(val) < 60:
+                    result["sold_by"] = val
+                    break
 
-        # ── Colors: walk DOM from "Colour" / "Color" label
+        # ── Colors: look for "MORE COLORS" section (Myntra's typical heading)
+        # or walk from "Colour"/"Color" label but validate each value
         colors = []
-        for node in soup.find_all(string=re.compile(r"^colou?r$", re.I)):
-            parent = node.find_parent()
-            for _ in range(6):
+        # Try "MORE COLORS" heading first
+        for heading in soup.find_all(string=re.compile(r"more\s+colou?rs?", re.I)):
+            parent = heading.find_parent()
+            for _ in range(5):
                 if not parent:
                     break
-                lis = parent.find_all("li")
-                if len(lis) >= 1:
+                imgs = parent.find_all("img")
+                lis  = parent.find_all("li")
+                if imgs or len(lis) >= 1:
                     break
                 parent = parent.find_parent()
             if parent:
-                for li in parent.find_all("li"):
-                    val = li.get("title") or li.get("aria-label") or _text(li)
-                    if val and len(val.strip()) < 30:
-                        colors.append(val.strip())
+                for img in parent.find_all("img"):
+                    alt = img.get("alt", "").strip()
+                    if alt and len(alt) < 30 and not _INVALID_COLOR_WORDS.search(alt):
+                        colors.append(alt)
+                if not colors:
+                    for li in parent.find_all("li"):
+                        val = li.get("title") or li.get("aria-label") or _text(li)
+                        if val and len(val.strip()) < 30 and not _INVALID_COLOR_WORDS.search(val):
+                            colors.append(val.strip())
+                break
+
+        # Fallback: walk from "Colour"/"Color" label but validate
+        if not colors:
+            for node in soup.find_all(string=re.compile(r"^colou?r$", re.I)):
+                parent = node.find_parent()
+                for _ in range(6):
+                    if not parent:
+                        break
+                    lis = parent.find_all("li")
+                    if len(lis) >= 1:
+                        break
+                    parent = parent.find_parent()
+                if parent:
+                    for li in parent.find_all("li"):
+                        val = li.get("title") or li.get("aria-label") or _text(li)
+                        val = (val or "").strip()
+                        if val and len(val) < 30 and not _INVALID_COLOR_WORDS.search(val):
+                            colors.append(val)
                 break
         result["colors"] = colors
 
