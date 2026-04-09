@@ -133,7 +133,8 @@ def _init_state():
         "flags_by_product": {},
         "timestamp": None,
         "is_running": False,
-        "key_bee": os.environ.get("SCRAPINGBEE_API_KEY", ""),
+        "key_bee":  os.environ.get("SCRAPINGBEE_API_KEY", ""),
+        "key_zyte": os.environ.get("ZYTE_API_KEY", ""),
         "keys_saved": False,
     }
     for k, v in defaults.items():
@@ -146,11 +147,15 @@ _init_state()
 def _apply_keys():
     if st.session_state["key_bee"]:
         os.environ["SCRAPINGBEE_API_KEY"] = st.session_state["key_bee"]
+    if st.session_state["key_zyte"]:
+        os.environ["ZYTE_API_KEY"] = st.session_state["key_zyte"]
 
 def _save_keys():
     ENV_FILE.touch(exist_ok=True)
     if st.session_state["key_bee"]:
         set_key(str(ENV_FILE), "SCRAPINGBEE_API_KEY", st.session_state["key_bee"])
+    if st.session_state["key_zyte"]:
+        set_key(str(ENV_FILE), "ZYTE_API_KEY", st.session_state["key_zyte"])
 
 _apply_keys()
 
@@ -172,6 +177,9 @@ def _check(val):
 
 def _bee_ok():
     return bool(os.environ.get("SCRAPINGBEE_API_KEY"))
+
+def _zyte_ok():
+    return bool(os.environ.get("ZYTE_API_KEY"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -230,8 +238,30 @@ with st.sidebar:
     st.markdown("### 👟 Neeman's Monitor")
     st.markdown("---")
 
-    # ── ScrapingBee key ──────────────────────────────────────────────────────
-    with st.expander("🔑 ScrapingBee API Key", expanded=not _bee_ok()):
+    # ── Zyte key (FK / Myntra) ───────────────────────────────────────────────
+    with st.expander("⚡ Zyte API Key  (Flipkart + Myntra)", expanded=not _zyte_ok()):
+        zyte_input = st.text_input(
+            "Zyte Key",
+            value=st.session_state["key_zyte"],
+            type="password",
+            placeholder="Paste your Zyte key…",
+            label_visibility="collapsed",
+        )
+        if st.button("💾 Save Zyte Key", use_container_width=True, type="primary", key="save_zyte"):
+            st.session_state["key_zyte"] = zyte_input.strip()
+            _apply_keys()
+            _save_keys()
+            st.session_state["keys_saved"] = True
+            st.rerun()
+
+        if st.session_state.get("keys_saved"):
+            st.success("Key saved ✅")
+            st.session_state["keys_saved"] = False
+
+        st.caption("Better anti-bot bypass for Flipkart & Myntra → [app.zyte.com](https://app.zyte.com)")
+
+    # ── ScrapingBee key (Amazon + fallback) ─────────────────────────────────
+    with st.expander("🔑 ScrapingBee API Key  (Amazon + fallback)", expanded=not _bee_ok()):
         bee_input = st.text_input(
             "API Key",
             value=st.session_state["key_bee"],
@@ -254,7 +284,8 @@ with st.sidebar:
 
     # ── Status ───────────────────────────────────────────────────────────────
     st.markdown("**Status**")
-    st.markdown(f"{'🟢' if _bee_ok() else '🔴'} ScrapingBee API Key")
+    st.markdown(f"{'🟢' if _zyte_ok() else '🔴'} Zyte API Key  *(FK / Myntra)*")
+    st.markdown(f"{'🟢' if _bee_ok() else '🔴'} ScrapingBee API Key  *(Amazon / fallback)*")
 
     st.markdown("---")
 
@@ -694,11 +725,13 @@ with tab_setup:
     st.markdown("### ⚙️ Setup")
 
     # Status cards
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     bee_ok = _bee_ok()
+    zyte_ok_val = _zyte_ok()
     for col, ok, label, hint in [
-        (c1, bee_ok,        "ScrapingBee API Key", "Enter in sidebar → 🔑"),
-        (c2, bool(catalog), "Catalog",             "Add rows in 📋 Catalog tab"),
+        (c1, zyte_ok_val,   "Zyte API Key",        "Enter in sidebar → ⚡  (FK/Myntra)"),
+        (c2, bee_ok,        "ScrapingBee API Key",  "Enter in sidebar → 🔑  (Amazon/fallback)"),
+        (c3, bool(catalog), "Catalog",              "Add rows in 📋 Catalog tab"),
     ]:
         bg, bd = ("#f0fdf4","#86efac") if ok else ("#fef2f2","#fca5a5")
         col.markdown(f"""
@@ -715,10 +748,18 @@ with tab_setup:
     col_s1, col_s2 = st.columns(2)
     with col_s1:
         st.markdown("""
-### Step 1 — ScrapingBee API Key
+### Step 1 — API Keys
+
+**Zyte API** *(recommended for Flipkart & Myntra)*
+1. Sign up at [app.zyte.com](https://app.zyte.com) *(free trial available)*
+2. Copy your API key → paste in sidebar → **⚡ Zyte API Key** → Save
+
+**ScrapingBee** *(required for Amazon, used as fallback)*
 1. Sign up at [app.scrapingbee.com](https://app.scrapingbee.com) *(free trial available)*
-2. Copy your API key from the dashboard
-3. Paste it in the sidebar → **🔑 ScrapingBee API Key** → Save
+2. Copy your API key → paste in sidebar → **🔑 ScrapingBee API Key** → Save
+
+> Zyte uses browser-grade rendering to bypass Flipkart/Myntra anti-bot.
+> If Zyte key is not set, ScrapingBee is used for all platforms.
 
 ---
 
@@ -760,10 +801,10 @@ with tab_setup:
 # TAB 5 — Debug HTML
 # ════════════════════════════════════════════════════════════════════════════════
 with tab_debug:
-    st.markdown("### 🔍 Debug — Raw HTML from ScrapingBee")
+    st.markdown("### 🔍 Debug — Raw HTML from Zyte / ScrapingBee")
     st.caption(
-        "Every scrape automatically saves the raw HTML ScrapingBee returned. "
-        "Download a file and send it to your developer to diagnose parser issues."
+        "Every scrape saves the raw rendered HTML (from Zyte or ScrapingBee). "
+        "Download a file and open it in your browser to diagnose parser issues."
     )
 
     debug_dir = Path("debug_html")

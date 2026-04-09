@@ -1,6 +1,16 @@
 """
 Shared scraping + flag logic for Neeman's Listing Health Monitor.
 Used by both monitor.py (CLI) and dashboard.py (web UI).
+
+Fetching strategy
+─────────────────
+• Flipkart / Myntra  → Zyte API  (browserHtml, country=in)   if ZYTE_API_KEY is set
+                     → ScrapingBee stealth proxy              otherwise
+• All other domains  → ScrapingBee (premium proxy, render_js)
+
+Zyte is industry-standard for anti-bot bypass and returns cleaner rendered HTML
+for JS-heavy sites like Flipkart and Myntra.  The same BeautifulSoup parsers run
+on the HTML regardless of which fetcher was used.
 """
 
 import os
@@ -19,7 +29,8 @@ from parsers import get_parser
 from storage import CatalogRow
 
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
-REQUEST_TIMEOUT = 90  # increased — FK/Myntra need more time with stealth proxy
+ZYTE_API_URL    = "https://api.zyte.com/v1/extract"
+REQUEST_TIMEOUT = 120  # Zyte browser rendering can be slower
 
 MIN_IMAGES      = 5
 MIN_TITLE_WORDS = 5
@@ -29,18 +40,92 @@ DEBUG_DIR = Path("debug_html")
 
 
 # ──────────────────────────────────────────────
-# ScrapingBee fetch
+# Zyte fetch  (preferred for FK / Myntra)
+# ──────────────────────────────────────────────
+
+# Domains routed to Zyte when ZYTE_API_KEY is available
+_ZYTE_DOMAINS = {"flipkart.com", "www.flipkart.com", "myntra.com", "www.myntra.com"}
+
+def fetch_html_zyte(url: str, save_debug: bool = True) -> tuple[str | None, str | None]:
+    """Fetch fully-rendered HTML via Zyte API (browserHtml)."""
+    api_key = os.environ.get("ZYTE_API_KEY")
+    if not api_key:
+        return None, "ZYTE_API_KEY not set."
+    url = url.strip()
+    domain = urlparse(url).netloc.lower()
+
+    payload = {
+        "url":         url,
+        "browserHtml": True,
+        "geolocation": "IN",       # serve Indian version of the page
+        "javascript":  True,       # wait for JS hydration
+        "actions": [               # scroll down to trigger lazy-loads
+            {"action": "waitForTimeout", "timeout": 3},
+            {"action": "scrollY", "y": 800},
+            {"action": "waitForTimeout", "timeout": 2},
+        ],
+    }
+    try:
+        resp = requests.post(
+            ZYTE_API_URL,
+            auth=(api_key, ""),
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        html = data.get("browserHtml", "") or resp.text
+
+        # ── Save raw HTML for debugging
+        if save_debug and html:
+            try:
+                DEBUG_DIR.mkdir(exist_ok=True)
+                safe = re.sub(r"[^\w\-]", "_", domain)
+                debug_file = DEBUG_DIR / f"{safe}.html"
+                debug_file.write_text(html, encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+        if resp.status_code == 200 and html:
+            return html, None
+        err_msg = data.get("detail") or data.get("message") or resp.text[:300]
+        return None, f"Zyte HTTP {resp.status_code}: {err_msg}"
+    except requests.Timeout:
+        return None, f"Zyte timeout after {REQUEST_TIMEOUT}s"
+    except requests.RequestException as exc:
+        return None, f"Zyte request error: {exc}"
+
+
+# ──────────────────────────────────────────────
+# ScrapingBee fetch  (fallback / Amazon / others)
 # ──────────────────────────────────────────────
 
 # Sites that need stealth proxy (extra anti-bot measures)
 _STEALTH_DOMAINS = {"flipkart.com", "www.flipkart.com", "myntra.com", "www.myntra.com"}
 
 def fetch_html(url: str, save_debug: bool = True) -> tuple[str | None, str | None]:
+    """
+    Route to Zyte for FK/Myntra (if key available), else ScrapingBee.
+    Returns (html, error_or_None).
+    """
+    domain = urlparse(url.strip()).netloc.lower()
+
+    # ── Try Zyte first for anti-bot heavy domains
+    if domain in _ZYTE_DOMAINS and os.environ.get("ZYTE_API_KEY"):
+        html, err = fetch_html_zyte(url, save_debug=save_debug)
+        if html:
+            return html, None
+        # If Zyte fails, fall through to ScrapingBee as backup
+        # (log the Zyte error but don't surface it if ScrapingBee succeeds)
+        zyte_err = err
+
+    # ── ScrapingBee
     api_key = os.environ.get("SCRAPINGBEE_API_KEY")
     if not api_key:
+        if domain in _ZYTE_DOMAINS:
+            return None, f"No ZYTE_API_KEY or SCRAPINGBEE_API_KEY set."
         return None, "SCRAPINGBEE_API_KEY not set."
+
     url = url.strip()
-    domain = urlparse(url).netloc.lower()
     stealth = domain in _STEALTH_DOMAINS
 
     params = {
