@@ -297,6 +297,19 @@ def parse_amazon_in(soup: BeautifulSoup) -> dict:
                 )
                 (colors_unavail if is_unavail else colors_avail).append(val)
 
+        # Last-resort size fallback: scan full page text for "N UK" patterns
+        # Handles cases where ScrapingBee returns a page without the variation script
+        if not sizes:
+            page_text = soup.get_text(" ", strip=True)
+            # Find isolated "N UK" tokens (not inside long sentences)
+            found = re.findall(r'\b([5-9]|1[0-3])\s*UK\b', page_text, re.I)
+            seen = set()
+            for n in found:
+                val = f"{n} UK"
+                if val not in seen and _is_valid_size(val):
+                    seen.add(val)
+                    sizes.append(val)
+
         result["sizes"] = list(dict.fromkeys(sizes))
         result["sizes_unavailable"] = list(dict.fromkeys(sizes_unavailable))
         result["colors"] = colors_avail
@@ -557,9 +570,11 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
             result["sizes"]            = list(dict.fromkeys(sizes))
             result["sizes_unavailable"]= list(dict.fromkeys(sizes_unavailable))
 
-            # ── In stock + Buy box: if selectedSeller exists and any size available
-            has_seller  = bool(pdp.get("selectedSeller"))
-            has_stock   = bool(sizes)
+            # ── In stock + Buy box
+            # selectedSeller is null until a size is clicked in the React UI,
+            # so also check sellers[] (always present if the product has any seller)
+            has_seller = bool(pdp.get("selectedSeller")) or bool(pdp.get("sellers"))
+            has_stock  = bool(sizes)
             result["in_stock"] = has_stock
             result["buy_box"]  = has_seller and has_stock
 
@@ -611,10 +626,9 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
         result["images_count"] = len(srcs)
 
         # ── HTML fallbacks for buy_box / in_stock / sold_by / colors
-        # (only used when pdpData wasn't available above)
 
-        if result["buy_box"] is False and result["in_stock"] is None:
-            # buy_box: Myntra renders "pdp-add-to-bag" div or "ADD TO BAG" text
+        # buy_box: always try HTML if still False (pdpData may have missed it)
+        if not result["buy_box"]:
             buy_btn = soup.select_one("div.pdp-add-to-bag, button.pdp-add-to-bag")
             if not buy_btn:
                 buy_btn = _find_buy_button(soup)
@@ -624,9 +638,11 @@ def parse_myntra_com(soup: BeautifulSoup) -> dict:
                     if re.fullmatch(r"add to (cart|bag)|buy now", txt, re.I):
                         buy_btn = el
                         break
-            result["buy_box"] = buy_btn is not None
+            if buy_btn:
+                result["buy_box"] = True
 
-            # in_stock: OOS signal scan
+        # in_stock: OOS scan only when pdpData didn't determine it
+        if result["in_stock"] is None:
             oos_found = False
             for el in soup.find_all(["div", "span", "p", "h4", "button"]):
                 if el.find(["div", "span", "p"]):

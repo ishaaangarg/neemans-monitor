@@ -134,7 +134,7 @@ def fetch_html(url: str, save_debug: bool = True) -> tuple[str | None, str | Non
         "premium_proxy":  "true",
         "country_code":   "in",
         "block_resources":"false",
-        "wait":           "4000" if stealth else "2000",
+        "wait":           "4000" if stealth else "3000",
         "window_width":   "1920",
         "window_height":  "1080",
     }
